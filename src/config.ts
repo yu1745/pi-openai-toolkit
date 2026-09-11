@@ -10,6 +10,7 @@ import {
 	DEFAULT_IMAGE_GENERATION_MODEL,
 	DEFAULT_NATIVE_FALLBACK_CONFIG,
 	DEFAULT_WEB_SEARCH_CONFIG,
+	DEFAULT_CODEX_CONTEXT_MODELS,
 	RESPONSES_COMPACT_CAPABLE_APIS,
 	BREAKER_LIMIT_MAX,
 	BREAKER_LIMIT_MIN,
@@ -40,6 +41,7 @@ import { MAX_IMAGE_MODEL_ID_CHARS } from "./image-generation/types";
 
 export const CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", TOOLKIT_ID);
 export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
 
 const TOP_LEVEL_FIELDS = new Set(["compaction", "webSearch", "imageGeneration", "autoMode"]);
 const COMPACTION_FIELDS = new Set([
@@ -558,12 +560,60 @@ function applyAutoModeBreakerConfig(
 	}
 }
 
+function syncCodexContextModelsFromSettings(
+	settingsPath: string,
+	warnings: string[],
+): string[] | undefined {
+	try {
+		if (!isFile(settingsPath)) return undefined;
+		const content = fs.readFileSync(settingsPath, "utf8");
+		const raw = JSON.parse(content);
+		if (!isRecord(raw)) return undefined;
+
+		const openaiToolkit = raw.openaiToolkit;
+		if (openaiToolkit === undefined || openaiToolkit === null || typeof openaiToolkit !== "object") {
+			// openaiToolkit 字段完全缺失，生成默认配置并写回 settings.json
+			raw.openaiToolkit = {
+				codexContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
+			};
+			try {
+				fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+			} catch (writeErr) {
+				warnings.push(`Failed to write default openaiToolkit to ${settingsPath}: ${writeErr}`);
+			}
+			return [...DEFAULT_CODEX_CONTEXT_MODELS];
+		}
+
+		if (isRecord(openaiToolkit)) {
+			if (!("codexContextModels" in openaiToolkit) || openaiToolkit.codexContextModels === undefined || openaiToolkit.codexContextModels === null) {
+				// 存在 openaiToolkit 对象但缺少 codexContextModels 键，补齐默认值并写回
+				openaiToolkit.codexContextModels = [...DEFAULT_CODEX_CONTEXT_MODELS];
+				try {
+					fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+				} catch (writeErr) {
+					warnings.push(`Failed to update default codexContextModels in ${settingsPath}: ${writeErr}`);
+				}
+				return [...DEFAULT_CODEX_CONTEXT_MODELS];
+			}
+
+			// 键存在（包括空数组 []），正常解析，不写回
+			return toStringList(openaiToolkit.codexContextModels, "openaiToolkit.codexContextModels", warnings);
+		}
+	} catch (err) {
+		warnings.push(`Failed to read settings from ${settingsPath}: ${err}`);
+	}
+	return undefined;
+}
+
 /**
- * Load the canonical toolkit config from
- * `~/.pi/agent/extensions/pi-openai-toolkit/config.json`.
+ * Load the canonical toolkit config.
+ * Reads codexContextModels from ~/.pi/agent/settings.json (openaiToolkit.codexContextModels).
  * A missing file silently yields defaults; legacy branded paths are never read.
  */
-export function loadToolkitConfig(configPath: string = CONFIG_PATH): LoadedToolkitConfig {
+export function loadToolkitConfig(
+	configPath: string = CONFIG_PATH,
+	settingsPath: string = SETTINGS_PATH,
+): LoadedToolkitConfig {
 	const warnings: string[] = [];
 	const resolved = cloneDefaults();
 	let source: string | undefined;
@@ -604,6 +654,12 @@ export function loadToolkitConfig(configPath: string = CONFIG_PATH): LoadedToolk
 				warnings.push("Ignoring autoMode: expected a JSON object.");
 			}
 		}
+	}
+
+	// 从 settings.json 的 openaiToolkit.codexContextModels 读取白名单
+	const settingsModels = syncCodexContextModelsFromSettings(settingsPath, warnings);
+	if (settingsModels !== undefined) {
+		resolved.compaction.gatewayContextModels = settingsModels;
 	}
 
 	resolved.compaction.artifactRoot = resolveConfiguredPath(

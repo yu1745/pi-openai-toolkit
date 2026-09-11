@@ -511,14 +511,19 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
 	thinkingLevel: "off",
 };
 
+export const DEFAULT_CODEX_CONTEXT_MODELS = [
+	"openai-codex/gpt-6-astra",
+	"openai-codex/gpt-5.6-sol",
+];
+
 export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 	enabled: true,
-	contextManagement: "off",
+	contextManagement: "remote",
 	allowCompactionContinuityBreak: false,
 	remoteCompactModel: undefined,
 	nativeFallback: { ...DEFAULT_NATIVE_FALLBACK_CONFIG },
 	responsesApis: [...RESPONSES_COMPACT_CAPABLE_APIS],
-	gatewayContextModels: [],
+	gatewayContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
 	contextReminderThresholdPercent: 5,
 	notifyOnLoad: false,
 	debug: false,
