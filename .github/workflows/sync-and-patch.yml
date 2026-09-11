@@ -1,0 +1,55 @@
+name: Sync Upstream & Apply Patch
+
+on:
+  schedule:
+    # 每天 UTC 20:00 (北京时间凌晨 04:00) 自动同步
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-and-patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        run: |
+          git remote add upstream https://github.com/awoaCrim/pi-openai-toolkit.git || true
+          git fetch upstream main
+
+      - name: Apply Patch to Upstream Main
+        run: |
+          # 提取当前分支保存的 patch 和 workflow 配置
+          cp -r .github/workflows /tmp/saved-workflows
+          cp -r patches /tmp/saved-patches
+
+          # 强制基于上游 main 分支检出
+          git checkout -B main upstream/main
+
+          # 恢复 workflow 和 patch 目录
+          mkdir -p .github/workflows patches
+          cp -r /tmp/saved-workflows/* .github/workflows/
+          cp -r /tmp/saved-patches/* patches/
+
+          # 应用 patch
+          git apply patches/allowlist.patch
+
+          # 提交变更并强推
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes needed."
+          else
+            git commit -m "feat: read codexContextModels allowlist from ~/.pi/agent/settings.json"
+            git push origin main --force
+          fi

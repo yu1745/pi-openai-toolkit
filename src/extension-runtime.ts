@@ -119,7 +119,7 @@ function isCodexContextModel(
 	config: CompactionConfig,
 ): boolean {
 	return config.contextManagement === "remote"
-		&& (isNativeCodexModel(model) || isCodexGatewayModel(model, config.gatewayContextModels));
+		&& (isNativeCodexModel(model, config.gatewayContextModels) || isCodexGatewayModel(model, config.gatewayContextModels));
 }
 
 function notifyRemoteContextFailure(ctx: ExtensionContext, reason: string): void {
