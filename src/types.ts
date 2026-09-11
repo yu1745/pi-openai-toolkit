@@ -511,7 +511,10 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
 	thinkingLevel: "off",
 };
 
-export const DEFAULT_CODEX_CONTEXT_MODELS = ["openai-codex/gpt-6-astra"];
+export const DEFAULT_CODEX_CONTEXT_MODELS = [
+	"openai-codex/gpt-6-astra",
+	"openai-codex/gpt-5.6-sol",
+];
 
 export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 	enabled: true,

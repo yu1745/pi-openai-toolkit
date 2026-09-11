@@ -134,14 +134,17 @@ index 9aa11a4..c557fec 100644
  
  function notifyRemoteContextFailure(ctx: ExtensionContext, reason: string): void {
 diff --git a/src/types.ts b/src/types.ts
-index 1060df7..e6143d0 100644
+index 1060df7..a1dbf8d 100644
 --- a/src/types.ts
 +++ b/src/types.ts
-@@ -511,14 +511,16 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
+@@ -511,14 +511,19 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
  	thinkingLevel: "off",
  };
  
-+export const DEFAULT_CODEX_CONTEXT_MODELS = ["openai-codex/gpt-6-astra"];
++export const DEFAULT_CODEX_CONTEXT_MODELS = [
++	"openai-codex/gpt-6-astra",
++	"openai-codex/gpt-5.6-sol",
++];
 +
  export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
  	enabled: true,
