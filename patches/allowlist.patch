@@ -1,0 +1,161 @@
+diff --git a/src/config.ts b/src/config.ts
+index b469322..894badb 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -10,6 +10,7 @@ import {
+ 	DEFAULT_IMAGE_GENERATION_MODEL,
+ 	DEFAULT_NATIVE_FALLBACK_CONFIG,
+ 	DEFAULT_WEB_SEARCH_CONFIG,
++	DEFAULT_CODEX_CONTEXT_MODELS,
+ 	RESPONSES_COMPACT_CAPABLE_APIS,
+ 	BREAKER_LIMIT_MAX,
+ 	BREAKER_LIMIT_MIN,
+@@ -40,6 +41,7 @@ import { MAX_IMAGE_MODEL_ID_CHARS } from "./image-generation/types";
+ 
+ export const CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", TOOLKIT_ID);
+ export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
++export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+ 
+ const TOP_LEVEL_FIELDS = new Set(["compaction", "webSearch", "imageGeneration", "autoMode"]);
+ const COMPACTION_FIELDS = new Set([
+@@ -558,12 +560,60 @@ function applyAutoModeBreakerConfig(
+ 	}
+ }
+ 
++function syncCodexContextModelsFromSettings(
++	settingsPath: string,
++	warnings: string[],
++): string[] | undefined {
++	try {
++		if (!isFile(settingsPath)) return undefined;
++		const content = fs.readFileSync(settingsPath, "utf8");
++		const raw = JSON.parse(content);
++		if (!isRecord(raw)) return undefined;
++
++		const openaiToolkit = raw.openaiToolkit;
++		if (openaiToolkit === undefined || openaiToolkit === null || typeof openaiToolkit !== "object") {
++			// openaiToolkit 字段完全缺失，生成默认配置并写回 settings.json
++			raw.openaiToolkit = {
++				codexContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
++			};
++			try {
++				fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
++			} catch (writeErr) {
++				warnings.push(`Failed to write default openaiToolkit to ${settingsPath}: ${writeErr}`);
++			}
++			return [...DEFAULT_CODEX_CONTEXT_MODELS];
++		}
++
++		if (isRecord(openaiToolkit)) {
++			if (!("codexContextModels" in openaiToolkit) || openaiToolkit.codexContextModels === undefined || openaiToolkit.codexContextModels === null) {
++				// 存在 openaiToolkit 对象但缺少 codexContextModels 键，补齐默认值并写回
++				openaiToolkit.codexContextModels = [...DEFAULT_CODEX_CONTEXT_MODELS];
++				try {
++					fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
++				} catch (writeErr) {
++					warnings.push(`Failed to update default codexContextModels in ${settingsPath}: ${writeErr}`);
++				}
++				return [...DEFAULT_CODEX_CONTEXT_MODELS];
++			}
++
++			// 键存在（包括空数组 []），正常解析，不写回
++			return toStringList(openaiToolkit.codexContextModels, "openaiToolkit.codexContextModels", warnings);
++		}
++	} catch (err) {
++		warnings.push(`Failed to read settings from ${settingsPath}: ${err}`);
++	}
++	return undefined;
++}
++
+ /**
+- * Load the canonical toolkit config from
+- * `~/.pi/agent/extensions/pi-openai-toolkit/config.json`.
++ * Load the canonical toolkit config.
++ * Reads codexContextModels from ~/.pi/agent/settings.json (openaiToolkit.codexContextModels).
+  * A missing file silently yields defaults; legacy branded paths are never read.
+  */
+-export function loadToolkitConfig(configPath: string = CONFIG_PATH): LoadedToolkitConfig {
++export function loadToolkitConfig(
++	configPath: string = CONFIG_PATH,
++	settingsPath: string = SETTINGS_PATH,
++): LoadedToolkitConfig {
+ 	const warnings: string[] = [];
+ 	const resolved = cloneDefaults();
+ 	let source: string | undefined;
+@@ -606,6 +656,12 @@ export function loadToolkitConfig(configPath: string = CONFIG_PATH): LoadedToolk
+ 		}
+ 	}
+ 
++	// 从 settings.json 的 openaiToolkit.codexContextModels 读取白名单
++	const settingsModels = syncCodexContextModelsFromSettings(settingsPath, warnings);
++	if (settingsModels !== undefined) {
++		resolved.compaction.gatewayContextModels = settingsModels;
++	}
++
+ 	resolved.compaction.artifactRoot = resolveConfiguredPath(
+ 		resolved.compaction.artifactRoot,
+ 		path.dirname(configPath),
+diff --git a/src/context-management/codex-provider.ts b/src/context-management/codex-provider.ts
+index 2445b11..d4a156a 100644
+--- a/src/context-management/codex-provider.ts
++++ b/src/context-management/codex-provider.ts
+@@ -25,8 +25,10 @@ export const CODEX_CONTEXT_PROVIDER_ERROR =
+ 
+ export function isNativeCodexModel(
+ 	model: ExtensionContext["model"] | undefined,
++	allowedModels: readonly string[] = [],
+ ): boolean {
+-	return model?.provider === CODEX_PROVIDER && model.api === CODEX_API;
++	if (model?.provider !== CODEX_PROVIDER || model.api !== CODEX_API) return false;
++	return isExactModelAllowed(model, allowedModels);
+ }
+ 
+ export function isCodexGatewayModel(
+@@ -184,7 +186,7 @@ export async function resolveCodexContextProvider(
+ 	};
+ 	if (!model) return { ok: false, reason: "unsupported-model" };
+ 
+-	const isNative = isNativeCodexModel(model);
++	const isNative = isNativeCodexModel(model, gatewayModels);
+ 	const isGateway = isCodexGatewayModel(model, gatewayModels);
+ 	if (!isNative && !isGateway) {
+ 		return { ok: false, reason: "unsupported-model", ...descriptor };
+diff --git a/src/extension-runtime.ts b/src/extension-runtime.ts
+index 9aa11a4..c557fec 100644
+--- a/src/extension-runtime.ts
++++ b/src/extension-runtime.ts
+@@ -119,7 +119,7 @@ function isCodexContextModel(
+ 	config: CompactionConfig,
+ ): boolean {
+ 	return config.contextManagement === "remote"
+-		&& (isNativeCodexModel(model) || isCodexGatewayModel(model, config.gatewayContextModels));
++		&& (isNativeCodexModel(model, config.gatewayContextModels) || isCodexGatewayModel(model, config.gatewayContextModels));
+ }
+ 
+ function notifyRemoteContextFailure(ctx: ExtensionContext, reason: string): void {
+diff --git a/src/types.ts b/src/types.ts
+index 1060df7..a1dbf8d 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -511,14 +511,19 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
+ 	thinkingLevel: "off",
+ };
+ 
++export const DEFAULT_CODEX_CONTEXT_MODELS = [
++	"openai-codex/gpt-6-astra",
++	"openai-codex/gpt-5.6-sol",
++];
++
+ export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
+ 	enabled: true,
+-	contextManagement: "off",
++	contextManagement: "remote",
+ 	allowCompactionContinuityBreak: false,
+ 	remoteCompactModel: undefined,
+ 	nativeFallback: { ...DEFAULT_NATIVE_FALLBACK_CONFIG },
+ 	responsesApis: [...RESPONSES_COMPACT_CAPABLE_APIS],
+-	gatewayContextModels: [],
++	gatewayContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
+ 	contextReminderThresholdPercent: 5,
+ 	notifyOnLoad: false,
+ 	debug: false,
