@@ -3,6 +3,7 @@ import {
 	codexContextProviderHeaders,
 	resolveCodexContextProvider,
 } from "./codex-provider";
+import { executeLocalHistory, executeLocalNotes } from "./local-backend";
 import {
 	isRecord,
 	type HistoryAction,
@@ -66,7 +67,9 @@ export const NOTES_ACTION_FIELDS: Record<NotesAction, readonly string[]> = {
 };
 
 export interface CodexHistoryNotesDetails {
-	codexHistoryNotes: Record<string, unknown>;
+	/** Generic success marker; codexHistoryNotes is retained for persisted remote sessions. */
+	contextManagement: Record<string, unknown>;
+	codexHistoryNotes?: Record<string, unknown>;
 }
 
 export async function callHistoryNotesBackend(
@@ -183,22 +186,25 @@ export async function executeHistoryNotesTool(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 	gatewayModels: readonly string[] = [],
+	backend: "remote" | "local" = "remote",
 ): Promise<AgentToolResult<CodexHistoryNotesDetails>> {
 	const endpoint = namespace === "history"
 		? HISTORY_ENDPOINTS[action as HistoryAction]
 		: NOTES_ENDPOINTS[action as NotesAction];
 	if (!endpoint) throw new Error(`Unsupported ${namespace} action`);
 	validateAction(namespace, action, params);
-	const result = await callHistoryNotesBackend(
-		endpoint,
-		stripAction(params),
-		ctx,
-		signal,
-		undefined,
-		gatewayModels,
-	);
-	if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));
-	const modelResult = { ...result.value };
+	let value: Record<string, unknown>;
+	if (backend === "local") {
+		if (signal?.aborted) throw new Error("Local history/notes request was aborted");
+		value = namespace === "history"
+			? await executeLocalHistory(action as HistoryAction, stripAction(params), ctx)
+			: await executeLocalNotes(action as NotesAction, stripAction(params), ctx);
+	} else {
+		const result = await callHistoryNotesBackend(endpoint, stripAction(params), ctx, signal, undefined, gatewayModels);
+		if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));
+		value = result.value;
+	}
+	const modelResult = { ...value };
 	delete modelResult.images;
 	const content: AgentToolResult<CodexHistoryNotesDetails>["content"] = [
 		{
@@ -208,8 +214,13 @@ export async function executeHistoryNotesTool(
 				: JSON.stringify(modelResult),
 		},
 	];
-	for (const image of parseBackendImages(result.value.images)) content.push(image);
-	return { content, details: { codexHistoryNotes: modelResult } };
+	for (const image of parseBackendImages(value.images)) content.push(image);
+	return {
+		content,
+		details: backend === "remote"
+			? { contextManagement: modelResult, codexHistoryNotes: modelResult }
+			: { contextManagement: modelResult },
+	};
 }
 
 export function formatHistoryNotesFailure(

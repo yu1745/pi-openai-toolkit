@@ -10,7 +10,6 @@ import {
 	DEFAULT_IMAGE_GENERATION_MODEL,
 	DEFAULT_NATIVE_FALLBACK_CONFIG,
 	DEFAULT_WEB_SEARCH_CONFIG,
-	DEFAULT_CODEX_CONTEXT_MODELS,
 	RESPONSES_COMPACT_CAPABLE_APIS,
 	BREAKER_LIMIT_MAX,
 	BREAKER_LIMIT_MIN,
@@ -39,9 +38,13 @@ import {
 } from "./types";
 import { MAX_IMAGE_MODEL_ID_CHARS } from "./image-generation/types";
 
-export const CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", TOOLKIT_ID);
+const AGENT_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR?.trim()
+	? path.resolve(process.env.PI_CODING_AGENT_DIR)
+	: path.join(os.homedir(), ".pi", "agent");
+
+export const CONFIG_DIR = path.join(AGENT_CONFIG_DIR, "extensions", TOOLKIT_ID);
 export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
-export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+export const SETTINGS_PATH = path.join(AGENT_CONFIG_DIR, "settings.json");
 
 const TOP_LEVEL_FIELDS = new Set(["compaction", "webSearch", "imageGeneration", "autoMode"]);
 const COMPACTION_FIELDS = new Set([
@@ -144,9 +147,14 @@ function toContextManagementMode(
 	if (value === undefined) return undefined;
 	if (typeof value === "string") {
 		const normalized = value.trim();
-		if (normalized === "off" || normalized === "remote") return normalized;
+		if (normalized === "off" || normalized === "auto") return normalized;
+		// Migrate the previously supported enabled value without rewriting user config.
+		if (normalized === "remote") {
+			warnings.push(`Migrating ${fieldPath}=remote to auto; native Codex remains remote and other providers use local context management.`);
+			return "auto";
+		}
 	}
-	warnings.push(`Ignoring ${fieldPath}: expected one of off, remote.`);
+	warnings.push(`Ignoring ${fieldPath}: expected one of auto, off.`);
 	return undefined;
 }
 
@@ -308,9 +316,10 @@ function applyCompactionConfig(
 	warnUnknownFields(raw, COMPACTION_FIELDS, "compaction", warnings);
 
 	resolved.enabled = toBoolean(raw.enabled, "compaction.enabled", warnings) ?? resolved.enabled;
-	resolved.contextManagement =
-		toContextManagementMode(raw.contextManagement, "compaction.contextManagement", warnings) ??
-		resolved.contextManagement;
+	if (raw.contextManagement !== undefined) {
+		resolved.contextManagement =
+			toContextManagementMode(raw.contextManagement, "compaction.contextManagement", warnings) ?? "off";
+	}
 	resolved.allowCompactionContinuityBreak =
 		toBoolean(
 			raw.allowCompactionContinuityBreak,
@@ -560,51 +569,6 @@ function applyAutoModeBreakerConfig(
 	}
 }
 
-function syncCodexContextModelsFromSettings(
-	settingsPath: string,
-	warnings: string[],
-): string[] | undefined {
-	try {
-		if (!isFile(settingsPath)) return undefined;
-		const content = fs.readFileSync(settingsPath, "utf8");
-		const raw = JSON.parse(content);
-		if (!isRecord(raw)) return undefined;
-
-		const openaiToolkit = raw.openaiToolkit;
-		if (openaiToolkit === undefined || openaiToolkit === null || typeof openaiToolkit !== "object") {
-			// openaiToolkit 字段完全缺失，生成默认配置并写回 settings.json
-			raw.openaiToolkit = {
-				codexContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
-			};
-			try {
-				fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
-			} catch (writeErr) {
-				warnings.push(`Failed to write default openaiToolkit to ${settingsPath}: ${writeErr}`);
-			}
-			return [...DEFAULT_CODEX_CONTEXT_MODELS];
-		}
-
-		if (isRecord(openaiToolkit)) {
-			if (!("codexContextModels" in openaiToolkit) || openaiToolkit.codexContextModels === undefined || openaiToolkit.codexContextModels === null) {
-				// 存在 openaiToolkit 对象但缺少 codexContextModels 键，补齐默认值并写回
-				openaiToolkit.codexContextModels = [...DEFAULT_CODEX_CONTEXT_MODELS];
-				try {
-					fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
-				} catch (writeErr) {
-					warnings.push(`Failed to update default codexContextModels in ${settingsPath}: ${writeErr}`);
-				}
-				return [...DEFAULT_CODEX_CONTEXT_MODELS];
-			}
-
-			// 键存在（包括空数组 []），正常解析，不写回
-			return toStringList(openaiToolkit.codexContextModels, "openaiToolkit.codexContextModels", warnings);
-		}
-	} catch (err) {
-		warnings.push(`Failed to read settings from ${settingsPath}: ${err}`);
-	}
-	return undefined;
-}
-
 /**
  * Load the canonical toolkit config.
  * Reads codexContextModels from ~/.pi/agent/settings.json (openaiToolkit.codexContextModels).
@@ -656,11 +620,9 @@ export function loadToolkitConfig(
 		}
 	}
 
-	// 从 settings.json 的 openaiToolkit.codexContextModels 读取白名单
-	const settingsModels = syncCodexContextModelsFromSettings(settingsPath, warnings);
-	if (settingsModels !== undefined) {
-		resolved.compaction.gatewayContextModels = settingsModels;
-	}
+	// Context management no longer consults or mutates settings.json. The legacy
+	// parameter remains for API compatibility with callers of loadToolkitConfig.
+	void settingsPath;
 
 	resolved.compaction.artifactRoot = resolveConfiguredPath(
 		resolved.compaction.artifactRoot,

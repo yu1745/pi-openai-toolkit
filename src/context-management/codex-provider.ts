@@ -27,8 +27,7 @@ export function isNativeCodexModel(
 	model: ExtensionContext["model"] | undefined,
 	allowedModels: readonly string[] = [],
 ): boolean {
-	if (model?.provider !== CODEX_PROVIDER || model.api !== CODEX_API) return false;
-	return isExactModelAllowed(model, allowedModels);
+	return model?.provider === CODEX_PROVIDER && model.api === CODEX_API;
 }
 
 export function isCodexGatewayModel(

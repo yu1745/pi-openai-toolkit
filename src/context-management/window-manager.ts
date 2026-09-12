@@ -10,6 +10,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { ContextWindowBudget, type ContextRemaining } from "./window-budget";
 import {
+	ContextStatusObserver,
+	type ContextBackend,
+	type ContextStatusDetails,
+} from "./context-observer";
+import {
 	rewriteEncryptedToolOutputs,
 	rewriteWindowHeaders,
 	rewriteWindowPayload,
@@ -46,6 +51,8 @@ type ThreadHintLoader = (
 	signal?: AbortSignal,
 ) => Promise<string | undefined>;
 
+type LifecycleWriter = ConstructorParameters<typeof ContextStatusObserver>[0];
+
 type WindowBoundaryEntry = Extract<SessionEntry, { type: "custom_message" }> & {
 	details: CodexContextManagementMessageDetails;
 };
@@ -58,18 +65,32 @@ export class CodexContextWindowManager {
 	private rolloverPending = false;
 	private trimPendingWindowId: string | undefined;
 	private readonly loadThreadHint: ThreadHintLoader;
+	private readonly observer: ContextStatusObserver;
+	private reminderThresholdPercent = 5;
+	private restoredReminder = false;
+	private restoredFallback = false;
+	private restoredNotes: { success: boolean; sizeBytes?: number } = { success: false };
 
-	constructor(loadThreadHint?: ThreadHintLoader) {
+	constructor(loadThreadHint?: ThreadHintLoader, lifecycleWriter?: LifecycleWriter) {
 		this.loadThreadHint = loadThreadHint ?? ((ctx, signal) => loadHistoryNotesThreadHint(ctx, signal));
+		this.observer = new ContextStatusObserver(lifecycleWriter);
 	}
 
-	reset(): void {
+	private resetWindowState(): void {
 		this.identity = undefined;
 		this.sessionId = undefined;
 		this.restoredMarkerId = undefined;
 		this.budget.reset();
 		this.rolloverPending = false;
 		this.trimPendingWindowId = undefined;
+		this.restoredReminder = false;
+		this.restoredFallback = false;
+		this.restoredNotes = { success: false };
+	}
+
+	reset(): void {
+		this.resetWindowState();
+		this.observer.reset();
 	}
 
 	currentIdentity(): ContextWindowIdentity | undefined {
@@ -77,7 +98,7 @@ export class CodexContextWindowManager {
 	}
 
 	restore(entries: readonly SessionEntry[], sessionId?: string): void {
-		this.reset();
+		this.resetWindowState();
 		this.sessionId = sessionId;
 		for (const entry of entries) {
 			if (entry.type === "compaction") {
@@ -98,6 +119,12 @@ export class CodexContextWindowManager {
 			}
 			this.budget.restore(details.kind, details.currentWindowId);
 		}
+		if (this.identity) {
+			const restored = findRestoredWindowStatus(entries, this.identity.currentWindowId, sessionId);
+			this.restoredReminder = restored.reminder;
+			this.restoredFallback = restored.fallback;
+			this.restoredNotes = findNotesCheckpointDetailsSinceBoundary(entries, sessionId);
+		}
 	}
 
 	/** Rebuild state when Pi navigates to a different session/branch. */
@@ -106,26 +133,37 @@ export class CodexContextWindowManager {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const latestMarkerId = findLatestContextMarkerId(entries, sessionId);
 		if (this.sessionId !== sessionId || this.restoredMarkerId !== latestMarkerId) {
+			const previousSessionId = this.sessionId;
+			const previousWindowId = this.identity?.currentWindowId;
 			this.restore(entries, sessionId);
+			if (previousSessionId !== sessionId || previousWindowId !== this.identity?.currentWindowId) {
+				this.observeRestoration(ctx as ExtensionContext);
+			}
 		}
 	}
 
 	ensureInitialized(pi: ExtensionAPI, ctx: ExtensionContext, active: boolean): void {
 		if (!active) return;
 		this.restore(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId());
-		if (this.identity) return;
+		if (this.identity) {
+			this.observeRestoration(ctx);
+			return;
+		}
+		this.observeRestoration(ctx);
 		const windowId = randomUUID();
 		this.sendWindowMessage(
 			pi,
 			ctx,
 			{ firstWindowId: windowId, currentWindowId: windowId, windowNumber: 0 },
 			{ triggerTurn: false, trimPreviousWindow: false },
+			undefined,
+			"initialized",
 		);
 	}
 
 	project(
 		messages: readonly AgentMessage[],
-		mode: "off" | "remote",
+		mode: "off" | "remote" | "local",
 	): AgentMessage[] {
 		if (mode === "off") {
 			return messages.filter(
@@ -166,7 +204,10 @@ export class CodexContextWindowManager {
 		options: StartContextWindowOptions,
 	): Promise<boolean> {
 		this.synchronize(ctx);
-		if (this.rolloverPending) return false;
+		if (this.rolloverPending) {
+			this.observer.recordRolloverRefused(ctx, "already-scheduled");
+			return false;
+		}
 		if (options.signal?.aborted) throw new Error("Remote context rollover was aborted");
 		this.rolloverPending = true;
 		try {
@@ -189,10 +230,11 @@ export class CodexContextWindowManager {
 					windowNumber: current.windowNumber + 1,
 				}
 				: { firstWindowId: currentWindowId, currentWindowId, windowNumber: 0 };
-			this.sendWindowMessage(pi, ctx, next, options, threadHint);
+			this.sendWindowMessage(pi, ctx, next, options, threadHint, "rollover");
 			return true;
 		} catch (error) {
 			this.rolloverPending = false;
+			this.observer.recordRolloverRefused(ctx, options.signal?.aborted ? "aborted" : "failed");
 			throw error;
 		}
 	}
@@ -204,14 +246,23 @@ export class CodexContextWindowManager {
 		contextReminderThresholdPercent: number,
 		contextTokens?: number,
 	): void {
-		if (!active || !this.identity || contextReminderThresholdPercent <= 0) return;
+		this.reminderThresholdPercent = contextReminderThresholdPercent;
+		const remaining = this.statusRemaining(ctx, contextTokens);
+		if (!active || !this.identity || contextReminderThresholdPercent <= 0) {
+			this.observer.recordBudget(ctx, remaining, contextReminderThresholdPercent);
+			return;
+		}
 		// Right after a rollover, Pi's usage anchor still reports the previous
 		// window's last request until the new window's first request completes.
 		// Budget decisions taken in that gap act on stale numbers: they burn the
 		// once-per-window reminder on a false alarm seconds after a successful
 		// rollover, leaving the window silent for the rest of its life.
-		if (!hasAssistantUsageSinceWindowBoundary(ctx.sessionManager.getBranch(), this.sessionId)) return;
+		if (!hasAssistantUsageSinceWindowBoundary(ctx.sessionManager.getBranch(), this.sessionId)) {
+			this.observer.recordBudget(ctx, remaining, contextReminderThresholdPercent);
+			return;
+		}
 		const reminder = this.budget.record(ctx, this.identity, contextTokens, contextReminderThresholdPercent);
+		this.observer.recordBudget(ctx, remaining, contextReminderThresholdPercent, reminder?.kind);
 		if (!reminder) return;
 		sendContextWindowMessage(
 			pi,
@@ -224,6 +275,59 @@ export class CodexContextWindowManager {
 
 	remaining(ctx: ExtensionContext, contextTokens?: number): ContextRemaining {
 		return this.budget.remaining(ctx, this.identity, contextTokens);
+	}
+
+	observeRuntime(
+		ctx: ExtensionContext,
+		backend: ContextBackend,
+		active: boolean,
+		contextReminderThresholdPercent: number,
+	): void {
+		this.reminderThresholdPercent = contextReminderThresholdPercent;
+		try {
+			// Update memory first so a runtime transition persists the latest budget
+			// in the same write. Unchanged per-turn runtime checks remain disk-free.
+			this.observer.recordBudget(ctx, this.statusRemaining(ctx), contextReminderThresholdPercent);
+		} catch {
+			// Context usage is observational here and must not affect activation.
+		}
+		this.observer.observeRuntime(ctx, backend, active, contextReminderThresholdPercent);
+	}
+
+	contextStatus(ctx: ExtensionContext, contextTokens?: number): ContextStatusDetails {
+		this.observer.recordBudget(
+			ctx,
+			this.statusRemaining(ctx, contextTokens),
+			this.reminderThresholdPercent,
+		);
+		return this.observer.snapshot(ctx, true);
+	}
+
+	private statusRemaining(ctx: ExtensionContext, contextTokens?: number): ContextRemaining {
+		const remaining = this.remaining(ctx, contextTokens);
+		if (!this.identity || contextTokens !== undefined) return remaining;
+		try {
+			return hasAssistantUsageSinceWindowBoundary(ctx.sessionManager.getBranch(), this.sessionId)
+				? remaining
+				: { ...remaining, remainingTokens: undefined };
+		} catch {
+			return { ...remaining, remainingTokens: undefined };
+		}
+	}
+
+	recordNotesCheckpoint(ctx: ExtensionContext, sizeBytes?: number): void {
+		this.observer.recordNotesCheckpoint(ctx, sizeBytes);
+	}
+
+	recordRolloverRequested(ctx: ExtensionContext): void {
+		this.observer.recordRolloverRequested(ctx);
+	}
+
+	recordRolloverRefused(
+		ctx: ExtensionContext,
+		reason: "notes-checkpoint-required" | "already-scheduled" | "aborted" | "failed",
+	): void {
+		this.observer.recordRolloverRefused(ctx, reason);
 	}
 
 	/** True when a notes checkpoint succeeded in the current window (after the latest boundary). */
@@ -274,7 +378,8 @@ export class CodexContextWindowManager {
 		};
 	}
 
-	rewritePayload(payload: unknown, ctx: ExtensionContext): unknown {
+	rewritePayload(payload: unknown, ctx: ExtensionContext, backend: "remote" | "local" = "remote"): unknown {
+		if (backend === "local") return rewriteContextNamespaceTools(payload, { encrypted: false });
 		const withMetadata = rewriteWindowPayload(payload, ctx, this.identity);
 		return rewriteContextNamespaceTools(withMetadata, { encrypted: true });
 	}
@@ -283,12 +388,22 @@ export class CodexContextWindowManager {
 		rewriteWindowHeaders(headers, ctx, this.identity);
 	}
 
+	private observeRestoration(ctx: ExtensionContext): void {
+		this.observer.recordRestoration(ctx, this.identity, {
+			reminderTriggered: this.restoredReminder,
+			fallbackTriggered: this.restoredFallback,
+			notesCheckpointSuccess: this.restoredNotes.success,
+			...(this.restoredNotes.sizeBytes !== undefined ? { notesSizeBytes: this.restoredNotes.sizeBytes } : {}),
+		});
+	}
+
 	private sendWindowMessage(
 		pi: ExtensionAPI,
 		ctx: ExtensionContext,
 		identity: ContextWindowIdentity,
 		options: StartContextWindowOptions,
 		threadHint?: string,
+		lifecycle: "initialized" | "rollover" = "rollover",
 	): void {
 		sendContextWindowMessage(
 			pi,
@@ -302,6 +417,8 @@ export class CodexContextWindowManager {
 		this.sessionId = ctx.sessionManager.getSessionId();
 		this.restoredMarkerId = undefined;
 		this.trimPendingWindowId = options.trimPreviousWindow ? identity.currentWindowId : undefined;
+		if (lifecycle === "initialized") this.observer.recordWindowInitialized(ctx, identity);
+		else this.observer.recordRolloverCompleted(ctx, identity);
 		// sendMessage has accepted the marker synchronously; clear only the
 		// in-flight guard so a later turn can roll over again.
 		this.rolloverPending = false;
@@ -370,6 +487,13 @@ export function findNotesCheckpointSinceBoundary(
 	entries: readonly SessionEntry[],
 	sessionId?: string,
 ): boolean {
+	return findNotesCheckpointDetailsSinceBoundary(entries, sessionId).success;
+}
+
+function findNotesCheckpointDetailsSinceBoundary(
+	entries: readonly SessionEntry[],
+	sessionId?: string,
+): { success: boolean; sizeBytes?: number } {
 	let boundaryIndex = -1;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const entry = entries[index]!;
@@ -384,8 +508,9 @@ export function findNotesCheckpointSinceBoundary(
 			break;
 		}
 	}
-	if (boundaryIndex < 0) return false;
+	if (boundaryIndex < 0) return { success: false };
 	const checkpointCalls = new Set<string>();
+	let checkpoint: { success: boolean; sizeBytes?: number } = { success: false };
 	for (let index = boundaryIndex + 1; index < entries.length; index += 1) {
 		const entry = entries[index]!;
 		if (entry.type !== "message") continue;
@@ -406,15 +531,44 @@ export function findNotesCheckpointSinceBoundary(
 			continue;
 		}
 		if (message.role === "toolResult" && checkpointCalls.has(message.toolCallId)) {
-			if (message.isError) {
-				checkpointCalls.delete(message.toolCallId);
-				continue;
-			}
-			const details = message.details;
-			if (isRecord(details) && isRecord(details.codexHistoryNotes)) return true;
+			checkpointCalls.delete(message.toolCallId);
+			if (message.isError || !isRecord(message.details)) continue;
+			const contextDetails = isRecord(message.details.contextManagement)
+				? message.details.contextManagement
+				: isRecord(message.details.codexHistoryNotes)
+					? message.details.codexHistoryNotes
+					: undefined;
+			if (!contextDetails) continue;
+			const file = isRecord(contextDetails.file) ? contextDetails.file : undefined;
+			const sizeBytes = typeof file?.size_bytes === "number" && Number.isFinite(file.size_bytes)
+				? file.size_bytes
+				: undefined;
+			checkpoint = { success: true, ...(sizeBytes !== undefined ? { sizeBytes } : {}) };
 		}
 	}
-	return false;
+	return checkpoint;
+}
+
+function findRestoredWindowStatus(
+	entries: readonly SessionEntry[],
+	windowId: string,
+	sessionId?: string,
+): { reminder: boolean; fallback: boolean } {
+	let reminder = false;
+	let fallback = false;
+	for (const entry of entries) {
+		if (entry.type !== "custom_message" || entry.customType !== CODEX_CONTEXT_WINDOW_MESSAGE_TYPE) continue;
+		if (!couldBelongToSession(entry.details, sessionId)) continue;
+		if (!isCodexContextManagementMessageDetails(entry.details)) {
+			throw new Error("Malformed persisted Codex context-window message");
+		}
+		if (!matchesSession(entry.details.sessionId, sessionId)) continue;
+		const details = entry.details.contextManagement;
+		if (details.currentWindowId !== windowId) continue;
+		if (details.kind === "reminder") reminder = true;
+		if (details.kind === "fallback") fallback = true;
+	}
+	return { reminder, fallback };
 }
 
 export function findLatestWindowBoundaryEntry(

@@ -44,7 +44,7 @@ export type DebugArtifactKind =
 	| "compaction-event"
 	| "lifecycle";
 
-export type ContextManagementMode = "off" | "remote";
+export type ContextManagementMode = "off" | "auto";
 
 /** Native-method fallback compaction: which model runs pi's compact() and how deeply. */
 export type NativeFallbackConfig = {
@@ -62,7 +62,7 @@ export type NativeFallbackConfig = {
 
 export type CompactionConfig = {
 	enabled: boolean;
-	/** Optional Codex Remote Context management. Disabled by default for compatibility. */
+	/** Context windows: native Codex uses its remote backend; every other provider uses the local backend. */
 	contextManagement: ContextManagementMode;
 	/**
 	 * Allow a Responses session whose latest compaction was not created by this extension
@@ -518,12 +518,12 @@ export const DEFAULT_CODEX_CONTEXT_MODELS = [
 
 export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 	enabled: true,
-	contextManagement: "remote",
+	contextManagement: "off",
 	allowCompactionContinuityBreak: false,
 	remoteCompactModel: undefined,
 	nativeFallback: { ...DEFAULT_NATIVE_FALLBACK_CONFIG },
 	responsesApis: [...RESPONSES_COMPACT_CAPABLE_APIS],
-	gatewayContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
+	gatewayContextModels: [],
 	contextReminderThresholdPercent: 5,
 	notifyOnLoad: false,
 	debug: false,

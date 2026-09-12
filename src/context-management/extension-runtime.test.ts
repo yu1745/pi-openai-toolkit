@@ -57,7 +57,7 @@ test("model selection evaluates the selected model rather than stale ctx.model",
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -83,7 +83,7 @@ test("a context-tool name conflict disables the Remote runtime instead of rewrit
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -117,7 +117,7 @@ test("remote config on a non-Codex model leaves Pi native compaction untouched",
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -132,7 +132,7 @@ test("remote config on a non-Codex model leaves Pi native compaction untouched",
 		branchEntries: [],
 		preparation: { firstKeptEntryId: "keep", tokensBefore: 10, messagesToSummarize: [], turnPrefixMessages: [] },
 	} as never, makeContext([], anthropicModel));
-	expect(result).toBeUndefined();
+	expect(result).toEqual({ cancel: true });
 });
 
 test("native Remote mode does not re-enter remote v2 when OAuth resolution fails", async () => {
@@ -149,7 +149,7 @@ test("native Remote mode does not re-enter remote v2 when OAuth resolution fails
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -200,7 +200,7 @@ test("native Remote mode skips legacy replay when context tools are unavailable"
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -232,7 +232,7 @@ test("remote context owns Codex compaction and activates only its four tools", a
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -327,7 +327,7 @@ test("history and notes tools carry usage guidance in promptGuidelines", async (
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -344,15 +344,16 @@ test("history and notes tools carry usage guidance in promptGuidelines", async (
 	expect(notesTool?.promptGuidelines?.join(" ")).toContain("new_context");
 });
 
-test("a non-covered gateway model never writes a window boundary or warns on session_start", async () => {
+test("auto uses local context management for a non-Codex gateway", async () => {
 	const handlers = new Map<string, (event: never, ctx: never) => unknown>();
 	const sentMessages: Array<{ customType?: string }> = [];
 	const notices: string[] = [];
+	const registered: Array<{ name:string; description:string; parameters:unknown; promptGuidelines?:string[] }> = [];
 	let active: string[] = ["read"];
 	const pi = {
 		on: (name: string, handler: (event: never, ctx: never) => unknown) => handlers.set(name, handler),
-		registerTool: () => undefined,
-		getAllTools: () => [],
+		registerTool: (tool: { name:string; description:string; parameters:unknown; promptGuidelines?:string[] }) => registered.push(tool),
+		getAllTools: () => registered,
 		getActiveTools: () => active,
 		setActiveTools: (names: string[]) => { active = names; },
 		sendMessage: (message: { customType?: string }) => { sentMessages.push(message); },
@@ -361,7 +362,7 @@ test("a non-covered gateway model never writes a window boundary or warns on ses
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -372,15 +373,14 @@ test("a non-covered gateway model never writes a window boundary or warns on ses
 	const ctx = {
 		...makeContext([], solModel),
 		hasUI: true,
-		ui: { notify: (_id: string, message: string) => notices.push(message) },
+		ui: { notify: (message: string) => notices.push(message) },
 	} as never;
 	await handlers.get("session_start")?.({} as never, ctx);
 
-	// Regression: tools.sync(false) also returns true; activation must key off
-	// the resolved model, not the sync success flag, or every gateway model
-	// receives a codex-context-window boundary message.
-	expect(sentMessages.filter((message) => message.customType === "codex-context-window")).toEqual([]);
-	expect(active).toEqual(["read"]);
+	// Non-Codex providers use the local backend but keep the same four-tool and
+	// window-boundary contract.
+	expect(sentMessages.filter((message) => message.customType === "codex-context-window")).toHaveLength(1);
+	expect(active).toEqual(["read", "new_context", "get_context_remaining", "history", "notes"]);
 	expect(notices).toEqual([]);
 });
 
@@ -408,7 +408,7 @@ test("switching into a covered model mid-session initializes the window lifecycl
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
-				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "remote", artifactRoot: "/tmp" },
+				compaction: { ...DEFAULT_COMPACTION_CONFIG, contextManagement: "auto", artifactRoot: "/tmp" },
 			},
 			warnings: [],
 		}),
@@ -424,7 +424,7 @@ test("switching into a covered model mid-session initializes the window lifecycl
 
 	const solModel = { provider: "uwoacrimson", api: "openai-responses", id: "gpt-5.6-sol", baseUrl: "https://newapi.example/v1", contextWindow: 272_000 };
 	await handlers.get("session_start")?.({} as never, statefulContext(solModel));
-	expect(branch).toEqual([]);
+	expect(branch).toHaveLength(1);
 
 	// sol -> covered model: the switch must open the window so later requests
 	// carry window metadata and the backend ingests from this point on.
@@ -435,8 +435,8 @@ test("switching into a covered model mid-session initializes the window lifecycl
 	await handlers.get("model_select")?.({ model, previousModel: model, source: "set" } as never, statefulContext(model));
 	expect(markerCount).toBe(1);
 
-	// Switching away to a non-covered model adds no boundary of its own.
+	// Switching to another provider keeps local context management active.
 	await handlers.get("model_select")?.({ model: solModel, previousModel: model, source: "set" } as never, statefulContext(model));
 	expect(markerCount).toBe(1);
-	expect(active).toEqual(["read"]);
+	expect(active).toEqual(["read", "new_context", "get_context_remaining", "history", "notes"]);
 });

@@ -69,7 +69,7 @@ describe("loadToolkitConfig", () => {
 			JSON.stringify({
 				compaction: {
 					enabled: true,
-					contextManagement: "remote",
+					contextManagement: "auto",
 					allowCompactionContinuityBreak: true,
 					remoteCompactModel: " uwoacrimson/gpt-5.6-luna ",
 					nativeFallback: {
@@ -117,7 +117,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.source).toBe(configPath);
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.compaction.allowCompactionContinuityBreak).toBe(true);
-		expect(loaded.config.compaction.contextManagement).toBe("remote");
+		expect(loaded.config.compaction.contextManagement).toBe("auto");
 		expect(loaded.config.compaction).not.toHaveProperty("codexGatewayModels");
 		expect(loaded.config.compaction.remoteCompactModel).toBe("uwoacrimson/gpt-5.6-luna");
 		expect(loaded.config.compaction.nativeFallback).toEqual({
@@ -235,7 +235,7 @@ describe("loadToolkitConfig", () => {
 	test("contextReminderThresholdPercent accepts 0-100 and ignores out-of-range", () => {
 		const configPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 10 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 10 },
 			}),
 		);
 		const loaded = loadToolkitConfig(configPath);
@@ -244,7 +244,7 @@ describe("loadToolkitConfig", () => {
 
 		const disabledPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 0 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 0 },
 			}),
 		);
 		const disabled = loadToolkitConfig(disabledPath);
@@ -253,7 +253,7 @@ describe("loadToolkitConfig", () => {
 
 		const invalidPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 150 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 150 },
 			}),
 		);
 		const invalid = loadToolkitConfig(invalidPath);
@@ -440,15 +440,15 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.autoMode.enabled).toBe(true);
 	});
 
-	test("contextManagement accepts only trimmed off/remote values and warns for local/tree/invalid values", () => {
-		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " remote " } }));
-		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("remote");
+	test("contextManagement accepts only trimmed auto/off values and warns for local/tree/invalid values", () => {
+		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " auto " } }));
+		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("auto");
 
 		const invalidPath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: "local" } }));
 		const invalid = loadToolkitConfig(invalidPath);
 		expect(invalid.config.compaction.contextManagement).toBe("off");
 		expect(invalid.warnings).toEqual([
-			"Ignoring compaction.contextManagement: expected one of off, remote.",
+			"Ignoring compaction.contextManagement: expected one of auto, off.",
 		]);
 	});
 

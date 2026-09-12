@@ -39,7 +39,7 @@ The extension config file is:
 
 All JSON configuration examples below, except the `models.json` example, go in this file. If it does not exist, create the file and its parent directory. If it already exists, merge fields into the matching objects and keep the other settings.
 
-## Quick start: enable Remote Context
+## Quick start: enable Context Management
 
 This section is for users who want Codex-style context windows. If you only want Web Search, image generation, or tool-call review, skip to [Common tasks](#common-tasks).
 
@@ -52,7 +52,7 @@ Create or merge this extension config:
 ```json
 {
   "compaction": {
-    "contextManagement": "remote"
+    "contextManagement": "auto"
   }
 }
 ```
@@ -65,9 +65,9 @@ pi --model openai-codex/<model-id>
 
 Replace `<model-id>` with the model ID shown by your Pi setup. The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools.
 
-### Use a compatible gateway
+### Use another provider or gateway
 
-This route requires the `openai-responses` API and a gateway that preserves the Codex protocol fields used by Remote Context. A successful ordinary chat request does not prove Remote Context compatibility.
+With `contextManagement: "auto"`, every provider other than native `openai-codex` uses the local context backend. It does not need to preserve Codex alpha headers or encrypted tool output. Local notes are stored in a project-isolated safe tree; local history treats Pi session JSONL as source of truth and maintains a disposable, incrementally synchronized SQLite/FTS5 index. Git projects are identified by a hash of the repository's common Git directory, so the main checkout, linked worktrees, and nested working directories share one identity while submodules remain independent. Non-Git directories, and any failed or timed-out Git probe, retain the previous canonical-working-directory hash behavior.
 
 If `~/.pi/agent/models.json` already contains a gateway model that meets these conditions, skip model configuration and set the extension allowlist directly. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
 
@@ -108,7 +108,7 @@ Use the same terminal session to start Pi. Create or merge the extension config,
 ```json
 {
   "compaction": {
-    "contextManagement": "remote",
+    "contextManagement": "auto",
     "gatewayContextModels": ["my-gateway/gpt-5.6-luna"]
   }
 }
@@ -183,8 +183,8 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | Key | Default | Use |
 | --- | --- | --- |
 | `compaction.enabled` | `true` | Master switch for compaction. |
-| `compaction.contextManagement` | `"off"` | Enables Codex Remote Context when set to `"remote"`. |
-| `compaction.gatewayContextModels` | `[]` | Gateway models allowed to use Remote Context. |
+| `compaction.contextManagement` | `"off"` | `"auto"` uses remote history/notes for native `openai-codex` and the local backend for all other providers. Unknown values fail closed. |
+| `compaction.gatewayContextModels` | `[]` | Legacy compatibility field; gateways use the local backend. |
 | `compaction.remoteCompactModel` | unset | Optional model used only for a v2 compaction request. |
 | `compaction.contextReminderThresholdPercent` | `5` | Remaining budget percentage for the once-per-window reminder. `0` disables the reminder and exhausted-window fallback. |
 | `webSearch.models` | `[]` | Models that receive hosted Web Search. |
@@ -194,6 +194,18 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | `autoMode.reviewerModel` | unset | Model that reviews Auto Mode calls. |
 | `autoMode.gate` | `"side-effect"` | Use `"all"` to review every tool call. |
 | `autoMode.timeoutMs` | `30000` | Review timeout in milliseconds. |
+
+## Local storage and context diagnostics
+
+Local Context storage lives below `~/.pi/agent/extensions/pi-openai-toolkit/context-management/`:
+
+- `notes/<project-key>/` contains Notes files. `<project-key>` is now the hashed Git common-directory identity described above, or the canonical-cwd hash fallback. Existing Notes directories created with an older cwd/worktree key are **not** migrated, deleted, or overwritten automatically; copy them manually only after verifying both directories.
+- `history/<project-key>.sqlite` is a disposable SQLite/FTS5 index rebuilt from Pi session JSONL. Linked worktree session directories share the index, and synchronization only removes stale sources from the session directory currently being scanned.
+- `status/<project-key>/<session-key>/latest.json` is the best-effort, atomically replaced status for one session. It is bounded to 16 KiB, its file mode is `0600` (directory `0700`), and it does not grow once per turn.
+
+The status reports the selected backend and activation, hashed project identity kind/key, window id/number and initialization/restoration, remaining budget and configured reminder threshold, reminder/fallback state, successful Notes checkpoint size when available, rollover outcome, and restoration state. `get_context_remaining` keeps its existing first sentence and token fields and also returns this status in `details.status`.
+
+Status collection is local-only and never includes Notes text, prompts, credentials, encrypted output, or cwd/session file paths. Writes are best-effort: an observer failure cannot block a request or context rollover. With `compaction.debug: true`, the same content-free status transitions are also written as detailed lifecycle artifacts; these lifecycle events do not include Notes or prompt bodies. Payload artifacts remain governed separately by the explicit payload logging options.
 
 ## Development
 
