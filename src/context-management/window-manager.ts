@@ -15,7 +15,7 @@ import {
 	type ContextStatusDetails,
 } from "./context-observer";
 import {
-	rewriteEncryptedToolOutputs,
+	rewriteLocalContextPayload,
 	rewriteWindowHeaders,
 	rewriteWindowPayload,
 } from "./window-request";
@@ -37,7 +37,8 @@ import {
 	isRecord,
 	isContextWindowCompactionDetails,
 } from "./types";
-import { encodeEncryptedOutputForContext, loadHistoryNotesThreadHint } from "./history-notes";
+import { encodeEncryptedOutputForContext } from "./history-notes";
+import { loadLocalThreadHint } from "./local-backend";
 import { rewriteContextNamespaceTools } from "./namespace-tools";
 
 interface StartContextWindowOptions {
@@ -76,7 +77,7 @@ export class CodexContextWindowManager {
 		lifecycleWriter?: LifecycleWriter,
 		private readonly agentNameForContext: (ctx: ExtensionContext) => string = () => "/root",
 	) {
-		this.loadThreadHint = loadThreadHint ?? ((ctx, signal) => loadHistoryNotesThreadHint(ctx, signal));
+		this.loadThreadHint = loadThreadHint ?? ((ctx) => loadLocalThreadHint(ctx));
 		this.observer = new ContextStatusObserver(lifecycleWriter);
 	}
 
@@ -382,8 +383,10 @@ export class CodexContextWindowManager {
 		};
 	}
 
-	rewritePayload(payload: unknown, ctx: ExtensionContext, backend: "remote" | "local" = "remote"): unknown {
-		if (backend === "local") return rewriteContextNamespaceTools(payload, { encrypted: false });
+	rewritePayload(payload: unknown, ctx: ExtensionContext, backend: "remote" | "local" = "local"): unknown {
+		if (backend === "local") {
+			return rewriteLocalContextPayload(rewriteContextNamespaceTools(payload, { encrypted: false }));
+		}
 		const withMetadata = rewriteWindowPayload(payload, ctx, this.identity);
 		return rewriteContextNamespaceTools(withMetadata, { encrypted: true });
 	}

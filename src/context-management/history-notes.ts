@@ -186,7 +186,7 @@ export async function executeHistoryNotesTool(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 	gatewayModels: readonly string[] = [],
-	backend: "remote" | "local" = "remote",
+	backend: "remote" | "local" = "local",
 ): Promise<AgentToolResult<CodexHistoryNotesDetails>> {
 	const endpoint = namespace === "history"
 		? HISTORY_ENDPOINTS[action as HistoryAction]
@@ -295,7 +295,7 @@ function parseBackendImages(value: unknown): Array<{
 	detail?: "auto" | "high" | "original";
 }> {
 	if (value === undefined) return [];
-	if (!isValidImages(value)) throw new Error("Remote history backend returned invalid image content");
+	if (!isValidImages(value)) throw new Error("History/notes backend returned invalid image content");
 	return value.map((item) => ({
 		type: "image" as const,
 		data: item.data,

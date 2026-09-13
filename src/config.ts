@@ -150,7 +150,7 @@ function toContextManagementMode(
 		if (normalized === "off" || normalized === "auto") return normalized;
 		// Migrate the previously supported enabled value without rewriting user config.
 		if (normalized === "remote") {
-			warnings.push(`Migrating ${fieldPath}=remote to auto; native Codex remains remote and other providers use local context management.`);
+			warnings.push(`Migrating ${fieldPath}=remote to auto; context management now uses the local backend for every provider.`);
 			return "auto";
 		}
 	}

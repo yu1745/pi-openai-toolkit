@@ -4,6 +4,8 @@ import type { ContextWindowIdentity } from "./types";
 import { CODEX_ENCRYPTED_OUTPUT_CONTEXT_MARKER } from "./history-notes";
 import { rewriteContextNamespaceCalls } from "./namespace-tools";
 
+const LOCAL_OMITTED_REMOTE_HISTORY_OUTPUT = "[Remote encrypted history/notes output omitted from local context]";
+
 export type ContextWindowRequestMetadata = {
 	session_id: string;
 	thread_id: string;
@@ -53,6 +55,32 @@ export function rewriteWindowPayload(
 		},
 	};
 	return rewriteEncryptedToolOutputs(rewriteContextNamespaceCalls(rewritten));
+}
+
+/**
+ * Keep local context transport free of opaque records produced by an older
+ * hosted history/notes backend. This targets function output only: native
+ * model reasoning and every other Responses item stay untouched.
+ */
+export function rewriteLocalContextPayload(payload: unknown): unknown {
+	const routed = rewriteContextNamespaceCalls(payload);
+	if (!isRecord(routed) || !Array.isArray(routed.input)) return routed;
+	let changed = false;
+	const input = routed.input.map((item) => {
+		if (!isRecord(item) || item.type !== "function_call_output") return item;
+		const output = item.output;
+		const isLegacyMarker = typeof output === "string" && output.startsWith(CODEX_ENCRYPTED_OUTPUT_CONTEXT_MARKER);
+		const hasEncryptedPart = Array.isArray(output) && output.some((part) =>
+			isRecord(part) && (
+				part.type === "encrypted_content" ||
+				(part.type === "input_text" && typeof part.text === "string" && part.text.startsWith(CODEX_ENCRYPTED_OUTPUT_CONTEXT_MARKER))
+			),
+		);
+		if (!isLegacyMarker && !hasEncryptedPart) return item;
+		changed = true;
+		return { ...item, output: LOCAL_OMITTED_REMOTE_HISTORY_OUTPUT };
+	});
+	return changed ? { ...routed, input } : routed;
 }
 
 export function rewriteEncryptedToolOutputs(payload: unknown): unknown {

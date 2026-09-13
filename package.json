@@ -6,7 +6,7 @@
   "engines": {
     "node": ">=22.19.0"
   },
-  "description": "OpenAI toolkit for Pi: Codex Remote Context windows, remote compaction v2, hosted Web Search, image gen, auto mode.",
+  "description": "OpenAI toolkit for Pi: local context windows, remote compaction v2, hosted Web Search, image gen, auto mode.",
   "author": "awoaCrim and contributors",
   "license": "MIT",
   "repository": {

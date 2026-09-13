@@ -1,6 +1,6 @@
 # pi-openai-toolkit
 
-Add Codex context windows, Responses compaction, hosted tools, and reviewed tool calls to Pi.
+Add local context windows, Responses compaction, hosted tools, and reviewed tool calls to Pi.
 
 [![npm version](https://img.shields.io/npm/v/pi-openai-toolkit.svg)](https://www.npmjs.com/package/pi-openai-toolkit)
 [![License: MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
@@ -11,7 +11,7 @@ Add Codex context windows, Responses compaction, hosted tools, and reviewed tool
 
 | Feature | Use it to |
 | --- | --- |
-| Codex Remote Context | Start a new context window and retrieve earlier windows with `history`. |
+| Local Context Management | Start a new context window and retrieve earlier windows with local `history` and `notes`. |
 | Remote Compaction v2 | Continue an eligible Responses session with an encrypted server checkpoint. |
 | Hosted Web Search | Give selected models OpenAI's hosted search tool. |
 | Image generation | Generate images or edit explicitly supplied local reference images. |
@@ -31,7 +31,7 @@ pi install npm:pi-openai-toolkit
 
 Use `--local` to install it in the current project.
 
-Installing the package alone does not enable every feature. With no extension config, compaction is enabled but Remote Context is off, the Web Search model list is empty, image generation is disabled, and Auto Mode has no allowed models or reviewer.
+Installing the package alone does not enable every feature. With no extension config, compaction is enabled but local Context Management is off, the Web Search model list is empty, image generation is disabled, and Auto Mode has no allowed models or reviewer.
 
 The extension config file is:
 
@@ -43,9 +43,9 @@ All JSON configuration examples below, except the `models.json` example, go in t
 
 This section is for users who want Codex-style context windows. If you only want Web Search, image generation, or tool-call review, skip to [Common tasks](#common-tasks).
 
-### Use Pi's built-in Codex provider
+### Use any configured Pi model
 
-You must already be signed in to Pi's built-in `openai-codex` provider.
+Context Management is local for every provider, including Pi's native `openai-codex` models. It has no separate context-backend authentication requirement; normal model inference still uses the provider authentication configured in Pi.
 
 Create or merge this extension config:
 
@@ -57,19 +57,17 @@ Create or merge this extension config:
 }
 ```
 
-Start Pi with a model from your existing Codex catalog:
+Start Pi with any model already configured in Pi, for example:
 
 ```bash
 pi --model openai-codex/<model-id>
 ```
 
-Replace `<model-id>` with the model ID shown by your Pi setup. The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools.
+The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools. With `contextManagement: "auto"`, all providers use the local backend: no Codex alpha history/notes request, hosted context header, or encrypted tool-output rewrite is used. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local context parity](docs/context-management-parity.md).
 
 ### Use another provider or gateway
 
-With `contextManagement: "auto"`, every provider other than native `openai-codex` uses the local context backend. It does not need Codex alpha headers or encrypted tool output. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local/remote parity](docs/context-management-parity.md).
-
-If `~/.pi/agent/models.json` already contains a gateway model that meets these conditions, skip model configuration and set the extension allowlist directly. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
+If `~/.pi/agent/models.json` already contains the model, skip model configuration. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
 
 ```json
 {
@@ -103,13 +101,12 @@ In a POSIX shell:
 export MY_GATEWAY_KEY="replace-with-your-gateway-key"
 ```
 
-Use the same terminal session to start Pi. Create or merge the extension config, and make the allowlist entry exactly match the provider and model ID:
+Use the same terminal session to start Pi. Create or merge the extension config:
 
 ```json
 {
   "compaction": {
-    "contextManagement": "auto",
-    "gatewayContextModels": ["my-gateway/gpt-5.6-luna"]
+    "contextManagement": "auto"
   }
 }
 ```
@@ -120,7 +117,7 @@ Start Pi with the same model specification:
 pi --model my-gateway/gpt-5.6-luna
 ```
 
-The enablement check is the same: the session should expose `new_context`, `get_context_remaining`, `history`, and `notes`. If they do not appear, read the toolkit notification and check the exact provider/model string, API, key, base URL, and allowlist entry.
+The enablement check is the same: the session should expose `new_context`, `get_context_remaining`, `history`, and `notes`. If they do not appear, read the toolkit notification and check the extension configuration and tool-name conflicts.
 
 Earlier windows remain available through `history`, but they are not all automatically added to the current context.
 
@@ -128,7 +125,7 @@ Earlier windows remain available through `history`, but they are not all automat
 
 ### Continue a session with server-side compaction
 
-Leave Remote Context off when you want the Responses compaction path instead. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
+Set Context Management to `"off"` when you want the Responses compaction path instead. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
 
 ### Enable hosted Web Search
 
@@ -183,8 +180,8 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | Key | Default | Use |
 | --- | --- | --- |
 | `compaction.enabled` | `true` | Master switch for compaction. |
-| `compaction.contextManagement` | `"off"` | `"auto"` uses remote history/notes for native `openai-codex` and the local backend for all other providers. Unknown values fail closed. |
-| `compaction.gatewayContextModels` | `[]` | Legacy compatibility field; gateways use the local backend. |
+| `compaction.contextManagement` | `"off"` | `"auto"` uses the local history/notes and context-window backend for every provider, including native `openai-codex`. Unknown values fail closed. |
+| `compaction.gatewayContextModels` | `[]` | Legacy compatibility field; it does not select context transport. |
 | `compaction.remoteCompactModel` | unset | Optional model used only for a v2 compaction request. |
 | `compaction.contextReminderThresholdPercent` | `5` | Remaining budget percentage for the once-per-window reminder. `0` disables the reminder and exhausted-window fallback. |
 | `webSearch.models` | `[]` | Models that receive hosted Web Search. |

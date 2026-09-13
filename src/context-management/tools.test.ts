@@ -116,7 +116,7 @@ test("get_context_remaining preserves its response and adds status details", asy
 	expect(result.details.status.projectIdentity.key).toMatch(/^[a-f0-9]{64}$/);
 });
 
-test("new_context is still gated when remote context is inactive", async () => {
+test("new_context is still gated when local context is inactive", async () => {
 	const branch = [
 		{
 			type: "custom_message", id: "entry-b", parentId: null, timestamp: "2026-09-07T00:00:00.000Z",
@@ -129,5 +129,5 @@ test("new_context is still gated when remote context is inactive", async () => {
 	const tools = createContextManagementTools(activePi, manager, () => false);
 	await expect(
 		tools.newContext.execute("t1", { force: true }, undefined, undefined, makeCtx(branch)),
-	).rejects.toThrow("remote-context-inactive");
+	).rejects.toThrow("local-context-inactive");
 });

@@ -89,10 +89,10 @@ export function createContextManagementTools(
 	manager: CodexContextWindowManager,
 	isActive: (ctx: ExtensionContext) => Promise<boolean> | boolean,
 	getGatewayModels: () => readonly string[] = () => [],
-	getBackend: (ctx: ExtensionContext) => "remote" | "local" = () => "remote",
+	getBackend: (ctx: ExtensionContext) => "remote" | "local" = () => "local",
 ): ContextManagementTools {
 	const assertActive = async (ctx: ExtensionContext): Promise<void> => {
-		if (!(await isActive(ctx))) throw new Error("remote-context-inactive");
+		if (!(await isActive(ctx))) throw new Error("local-context-inactive");
 	};
 	const newContext: ToolDefinition<typeof NEW_CONTEXT_PARAMETERS, NewContextDetails> = {
 		name: "new_context",

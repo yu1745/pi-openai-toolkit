@@ -62,7 +62,7 @@ export type NativeFallbackConfig = {
 
 export type CompactionConfig = {
 	enabled: boolean;
-	/** Context windows: native Codex uses its remote backend; every other provider uses the local backend. */
+	/** Context windows use the local history/notes backend for every provider. */
 	contextManagement: ContextManagementMode;
 	/**
 	 * Allow a Responses session whose latest compaction was not created by this extension
@@ -81,9 +81,8 @@ export type CompactionConfig = {
 	 */
 	responsesApis: string[];
 	/**
-	 * Exact "provider/model" keys allowed to use Codex Remote Context on the
-	 * `openai-responses` gateway wire. The native `openai-codex` route ignores
-	 * this list; gateway coverage is opt-in per model.
+	 * Legacy compatibility field. Context management no longer selects a hosted
+	 * backend or emits Codex context transport from these model entries.
 	 */
 	gatewayContextModels: string[];
 	/**
