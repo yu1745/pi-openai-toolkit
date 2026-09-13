@@ -15,6 +15,9 @@ import {
 import { routeContextNamespaceToolMessage } from "./context-management/namespace-tools";
 import { loadHistoryNotesThreadHint } from "./context-management/history-notes";
 import { loadLocalThreadHint } from "./context-management/local-backend";
+import { registerLocalHistorySource, unregisterLocalHistorySource } from "./context-management/history-source";
+import { checkpointLocalHistory } from "./context-management/history-service";
+import { localContextIdentity } from "./context-management/local-identity";
 import { CodexContextWindowManager } from "./context-management/window-manager";
 import { registerContextManagementTools } from "./context-management/tools";
 import { writeDebugArtifact, writeReplayFailureArtifact } from "./debug";
@@ -776,6 +779,7 @@ export default function registerCompactionExtension(
 				ctx,
 			);
 		},
+		(ctx) => isNativeCodexModel(ctx.model) ? "/root" : localContextIdentity(ctx).agentName,
 	);
 	const dependencies: CompactionDependencies = {
 		loadConfig,
@@ -784,6 +788,7 @@ export default function registerCompactionExtension(
 		contextWindows,
 		...overrides,
 	};
+	let localSourceRegistered = false;
 	let tools!: ReturnType<typeof registerContextManagementTools>;
 	tools = registerContextManagementTools(
 		pi,
@@ -809,6 +814,14 @@ export default function registerCompactionExtension(
 		// itself, or non-covered models would receive a window boundary.
 		const synced = tools.sync(active);
 		const effectiveActive = active && synced;
+		if (effectiveActive && selectedContextBackend(config, model) === "local") {
+			try {
+				await registerLocalHistorySource(ctx);
+				localSourceRegistered = true;
+			} catch {
+				notifyWarning(ctx, "Local history source registration failed; history calls will retry.");
+			}
+		}
 		contextWindows.observeRuntime(
 			ctx,
 			selectedContextBackend(config, model),
@@ -873,7 +886,15 @@ export default function registerCompactionExtension(
 	pi.on("context", (event, ctx) => handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, remoteContextActive));
 	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, remoteContextActive));
 	pi.on("session_compact", (event, _ctx) => contextWindows.recordCompaction(event.compactionEntry.details));
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (localSourceRegistered) {
+			try { await checkpointLocalHistory(ctx); }
+			catch { notifyWarning(ctx, "Local history checkpoint failed during shutdown."); }
+			finally {
+				unregisterLocalHistorySource(ctx);
+				localSourceRegistered = false;
+			}
+		}
 		const config = dependencies.loadConfig().config.compaction;
 		contextWindows.observeRuntime(
 			ctx,
@@ -899,7 +920,12 @@ export default function registerCompactionExtension(
 		}
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
-		await syncTools(ctx);
+		const active = await syncTools(ctx);
+		const config = dependencies.loadConfig().config.compaction;
+		if (active && selectedContextBackend(config, ctx.model) === "local") {
+			const identity = localContextIdentity(ctx);
+			return { systemPrompt: `${_event.systemPrompt}\n\nLocal context identity: agent ${identity.agentName}. History and notes are scoped to this task/session, not the project. Relative notes paths use ${identity.agentName}/notes; absolute virtual paths can address another agent's notes in this task. History defaults to this agent; use agent_name for another agent.` };
+		}
 	});
 	pi.on("before_provider_request", (event, ctx) => handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, remoteContextActive));
 	pi.on("before_provider_headers", async (event, ctx) => {

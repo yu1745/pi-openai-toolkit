@@ -24,6 +24,7 @@ export function projectHistoryEntries(
 	entries: readonly SessionEntry[],
 	sessionId: string,
 	filePath: string,
+	agentName = "/root",
 ): ProjectedHistoryEntry[] {
 	const byId = new Map(entries.map((entry) => [entry.id, entry]));
 	const windows = new Map<string, string>();
@@ -53,7 +54,7 @@ export function projectHistoryEntries(
 		entryId: entry.id,
 		sessionId,
 		windowId: resolveWindow(entry),
-		agentName: "/root",
+		agentName,
 		timestamp: entry.timestamp,
 		sequence,
 		...renderHistoryEntry(entry),

@@ -99,7 +99,7 @@ export function createContextManagementTools(
 		label: "new_context",
 		description: "Start a new context window without generating a conversation summary. Requires a successful notes checkpoint in the current window unless force is set.",
 		parameters: NEW_CONTEXT_PARAMETERS,
-		promptSnippet: "Start a new remote Codex context window without summarizing history.",
+		promptSnippet: "Start a new context window without summarizing history.",
 		promptGuidelines: ["Checkpoint active work in notes before calling new_context; no conversation summary carries over. A successful notes append/write in this window is required unless the user explicitly accepts discarding unsaved state (force=true)."],
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
@@ -139,7 +139,7 @@ export function createContextManagementTools(
 		label: "history",
 		description: "Search or read prior context-window history. Pass IDs unchanged.",
 		parameters: HISTORY_PARAMETERS,
-		promptSnippet: "Search or read prior remote Codex context-window history.",
+		promptSnippet: "Search or read prior context-window history; default to the current agent.",
 		promptGuidelines: [
 			"When the user asks about decisions, code, or details from earlier in the conversation that are no longer in the current context window, use history first instead of relying on fragments that survived compaction.",
 			"Use read_item with the exact item_id returned by list_items or search_contents; never rewrite, truncate, or guess IDs.",
@@ -157,7 +157,7 @@ export function createContextManagementTools(
 		label: "notes",
 		description: "Read and checkpoint notes across context windows.",
 		parameters: NOTES_PARAMETERS,
-		promptSnippet: "Read and checkpoint remote Codex notes across context windows.",
+		promptSnippet: "Read and checkpoint agent-scoped notes across context windows within this task.",
 		promptGuidelines: [
 			"Before calling new_context, checkpoint the current turn's active work (unfinished tasks, decisions, open questions, references) into notes with append_to_file or write_file so it survives the window change.",
 			"When a large task spans multiple context windows, keep a running note per line of work and read it at the start of each new window; append new state instead of replacing it unless the note is stale.",

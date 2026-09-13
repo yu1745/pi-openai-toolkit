@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { ProjectedHistoryEntry } from "./history-projector";
 import type { SessionSnapshot } from "./history-source";
 
-export const HISTORY_SCHEMA_VERSION = 2;
+export const HISTORY_SCHEMA_VERSION = 3;
 
 type Statement = {
 	run(...params: unknown[]): unknown;
@@ -29,9 +29,17 @@ async function openDatabase(file: string): Promise<Database> {
 }
 
 function schema(database: Database): void {
-	database.exec(`
-		PRAGMA journal_mode=WAL;
-		PRAGMA synchronous=NORMAL;
+	// Wait for another Pi process instead of treating a transient writer lock as corruption.
+	database.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+	database.exec("BEGIN IMMEDIATE");
+	try {
+		const version = Number((database.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)?.user_version ?? 0);
+		if (version !== 0 && version !== HISTORY_SCHEMA_VERSION) {
+			// Rebuild only an explicit schema-version mismatch, in place under the SQLite lock.
+			// Never unlink the database/WAL while another process may still have them open.
+			database.exec("DROP TABLE IF EXISTS entries_fts; DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS source_files;");
+		}
+		database.exec(`
 		CREATE TABLE IF NOT EXISTS source_files (
 			file_path TEXT PRIMARY KEY,
 			source_root TEXT NOT NULL,
@@ -57,34 +65,28 @@ function schema(database: Database): void {
 		CREATE INDEX IF NOT EXISTS entries_window ON entries(window_id, timestamp);
 		CREATE INDEX IF NOT EXISTS entries_item ON entries(entry_id, window_id);
 		CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(entry_key UNINDEXED, text);
-	`);
-	const version = Number((database.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)?.user_version ?? 0);
-	if (version !== 0 && version !== HISTORY_SCHEMA_VERSION) throw new Error("history schema version mismatch");
-	database.exec(`PRAGMA user_version=${HISTORY_SCHEMA_VERSION}`);
-}
-
-async function rebuild(file: string): Promise<Database> {
-	await fs.rm(file, { force: true });
-	await fs.rm(`${file}-wal`, { force: true });
-	await fs.rm(`${file}-shm`, { force: true });
-	const database = await openDatabase(file);
-	schema(database);
-	return database;
-}
-
-export async function openHistoryDatabase(file: string): Promise<Database> {
-	let database: Database | undefined;
-	try {
-		database = await openDatabase(file);
-		schema(database);
-		return database;
-	} catch {
-		database?.close();
-		return rebuild(file);
+		`);
+		database.exec(`PRAGMA user_version=${HISTORY_SCHEMA_VERSION}`);
+		database.exec("COMMIT");
+	} catch (error) {
+		database.exec("ROLLBACK");
+		throw error;
 	}
 }
 
-function removeFile(database: Database, filePath: string): void {
+export async function openHistoryDatabase(file: string): Promise<Database> {
+	const database = await openDatabase(file);
+	try {
+		schema(database);
+		return database;
+	} catch (error) {
+		database.close();
+		// Lock, permission, I/O and corruption errors are not a license to delete data.
+		throw error;
+	}
+}
+
+export function removeHistorySource(database: Database, filePath: string): void {
 	const keys = database.prepare("SELECT entry_key FROM entries WHERE file_path = ?").all(filePath) as Array<{ entry_key: string }>;
 	const removeFts = database.prepare("DELETE FROM entries_fts WHERE entry_key = ?");
 	for (const row of keys) removeFts.run(row.entry_key);
@@ -125,11 +127,10 @@ export function synchronizeSnapshot(
 	) {
 		start = previous.entry_count;
 		outcome = "incremental";
-	} else {
-		removeFile(database, snapshot.filePath);
 	}
 	database.exec("BEGIN IMMEDIATE");
 	try {
+		if (outcome === "rebuilt") removeHistorySource(database, snapshot.filePath);
 		for (const entry of entries.slice(start)) insertEntry(database, entry);
 		database.prepare(`INSERT OR REPLACE INTO source_files(file_path,source_root,session_id,size,mtime_ms,entry_count)
 			VALUES (?,?,?,?,?,?)`).run(
@@ -153,7 +154,7 @@ export function removeDeletedSources(
 		? database.prepare("SELECT file_path FROM source_files").all()
 		: database.prepare("SELECT file_path FROM source_files WHERE source_root = ?").all(sourceRoot)
 	) as Array<{ file_path: string }>;
-	for (const file of files) if (!retained.has(file.file_path)) removeFile(database, file.file_path);
+	for (const file of files) if (!retained.has(file.file_path)) removeHistorySource(database, file.file_path);
 }
 
 export type { Database as HistoryDatabase };

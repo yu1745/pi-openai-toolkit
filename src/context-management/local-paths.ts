@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR } from "../config";
+import { localContextIdentity, validAgentName } from "./local-identity";
 
 export function canonicalPath(input: string): string {
 	const resolved = path.resolve(input);
@@ -90,12 +91,49 @@ export const _localPathsTest = {
 	clearProjectIdentityCache: () => projectIdentityCache.clear(),
 };
 
-export function localNotesRoot(ctx: ExtensionContext): string {
-	return path.join(CONFIG_DIR, "context-management", "notes", projectKey(ctx));
+export function localSessionRoot(ctx: Pick<ExtensionContext, "sessionManager">): string {
+	const identity = localContextIdentity(ctx);
+	return path.join(CONFIG_DIR, "context-management", "sessions", hashIdentityPath(identity.rootSessionId));
+}
+
+/** Root of the virtual agent tree: /root/notes, /root/<child>/notes, ... */
+export function localAgentsRoot(ctx: Pick<ExtensionContext, "sessionManager">): string {
+	return path.join(localSessionRoot(ctx), "agents");
+}
+
+export function localNotesRoot(ctx: ExtensionContext, agentName = localContextIdentity(ctx).agentName): string {
+	if (!validAgentName(agentName)) throw new Error("invalid notes agent name");
+	return path.join(localAgentsRoot(ctx), ...agentName.slice(1).split("/"), "notes");
 }
 
 export function localHistoryDatabasePath(ctx: ExtensionContext): string {
-	return path.join(CONFIG_DIR, "context-management", "history", `${projectKey(ctx)}.sqlite`);
+	return path.join(localSessionRoot(ctx), "history.sqlite");
+}
+
+export type LocalNotePath = {
+	/** Canonical virtual path, never an OS filesystem path. */
+	virtual: string;
+	/** Path within the session's agents tree. */
+	relative: string;
+	agentName: string;
+};
+
+export function resolveLocalNotePath(raw: unknown, currentAgent: string, prefix = false): LocalNotePath {
+	if (prefix && (raw === undefined || raw === null || raw === "")) raw = `${currentAgent}/notes`;
+	if (typeof raw !== "string" || !raw || raw.includes("\\") || /[\u0000-\u001f\u007f]/.test(raw)) {
+		throw new Error("notes path must be a non-empty virtual path");
+	}
+	const absolute = raw.startsWith("/") ? raw : `${currentAgent}/notes/${raw}`;
+	const parts = absolute.slice(1).split("/");
+	if (parts.some((part) => !part || part === "." || part === "..")) {
+		throw new Error("notes path escapes the agent tree or contains an empty/dot component");
+	}
+	const notesIndex = parts.indexOf("notes");
+	const agentName = `/${parts.slice(0, notesIndex).join("/")}`;
+	if (notesIndex < 1 || !validAgentName(agentName) || (!prefix && notesIndex === parts.length - 1)) {
+		throw new Error("notes paths must use <agent_name>/notes/<path>");
+	}
+	return { virtual: absolute, relative: parts.join("/"), agentName };
 }
 
 export function safeRelativePath(raw: unknown, label = "path"): string {

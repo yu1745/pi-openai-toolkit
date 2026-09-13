@@ -48,6 +48,13 @@ test("initializes and restores a persisted window marker", () => {
 	expect(restored.currentIdentity()).toEqual(identity);
 });
 
+test("local child window markers use the host-supplied agent name", () => {
+	const sent: Array<Record<string, unknown>> = [];
+	const manager = new CodexContextWindowManager(async () => undefined, undefined, () => "/root/worker");
+	manager.ensureInitialized(fakePi(sent), fakeContext(), true);
+	expect(sent[0]?.content).toContain("Agent name: /root/worker");
+});
+
 test("allows multiple new context rollovers and keeps the guard transient", async () => {
 	const sent: Array<Record<string, unknown>> = [];
 	const manager = new CodexContextWindowManager(async () => undefined);

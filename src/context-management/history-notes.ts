@@ -198,7 +198,7 @@ export async function executeHistoryNotesTool(
 		if (signal?.aborted) throw new Error("Local history/notes request was aborted");
 		value = namespace === "history"
 			? await executeLocalHistory(action as HistoryAction, stripAction(params), ctx)
-			: await executeLocalNotes(action as NotesAction, stripAction(params), ctx);
+			: await executeLocalNotes(action as NotesAction, stripAction(params), ctx, signal);
 	} else {
 		const result = await callHistoryNotesBackend(endpoint, stripAction(params), ctx, signal, undefined, gatewayModels);
 		if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));

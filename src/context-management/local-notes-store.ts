@@ -1,14 +1,20 @@
 import { constants, promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { localNotesRoot, safeOptionalPrefix, safeRelativePath } from "./local-paths";
+import { localAgentsRoot, localSessionRoot, resolveLocalNotePath } from "./local-paths";
+import { withLocalFileLock } from "./local-file-lock";
+import { localContextIdentity } from "./local-identity";
 import type { NotesAction } from "./types";
 
 export const MAX_NOTE_BYTES = 1_000_000;
 export const MAX_NOTE_RESULT_BYTES = 200_000;
 const MAX_NOTE_FILES = 1_000;
-const queues = new Map<string, Promise<unknown>>();
+// SDK child sessions may load a separate extension instance in the same process.
+const QUEUES_KEY = Symbol.for("pi-openai-toolkit:local-note-queues:v1");
+const shared = globalThis as typeof globalThis & { [QUEUES_KEY]?: Map<string, Promise<unknown>> };
+const queues = shared[QUEUES_KEY] ??= new Map<string, Promise<unknown>>();
 
 type NoteFile = {
 	relative: string;
@@ -24,6 +30,8 @@ function bounded(value: unknown, fallback: number, maximum: number): number {
 
 async function ensureSafeParent(root: string, relative: string): Promise<string> {
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
+	const rootStat = await fs.lstat(root);
+	if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("notes root is not a safe directory");
 	const parts = relative.split("/");
 	let current = root;
 	for (const part of parts.slice(0, -1)) {
@@ -59,9 +67,12 @@ async function openRegularNoFollow(file: string) {
 	return { handle, stat };
 }
 
-async function listFiles(ctx: ExtensionContext): Promise<NoteFile[]> {
-	const root = localNotesRoot(ctx);
-	await fs.mkdir(root, { recursive: true, mode: 0o700 });
+async function listFiles(ctx: ExtensionContext, rawPrefix?: unknown): Promise<NoteFile[]> {
+	const root = localAgentsRoot(ctx);
+	const prefix = resolveLocalNotePath(rawPrefix, localContextIdentity(ctx).agentName, true);
+	// Scan only the selected agent's notes, never a sibling's directory.
+	const notesDirectory = `${prefix.agentName.slice(1)}/notes`;
+	const sentinel = await ensureSafeParent(root, `${notesDirectory}/.listing`);
 	const output: NoteFile[] = [];
 	async function walk(directory: string): Promise<void> {
 		if (output.length >= MAX_NOTE_FILES) return;
@@ -71,9 +82,10 @@ async function listFiles(ctx: ExtensionContext): Promise<NoteFile[]> {
 			if (item.isDirectory()) await walk(full);
 			else if (item.isFile()) {
 				const stat = await fs.stat(full);
-				if (stat.size <= MAX_NOTE_BYTES) {
+				const relative = `/${path.relative(root, full).split(path.sep).join("/")}`;
+				if (stat.size <= MAX_NOTE_BYTES && relative.startsWith(prefix.virtual)) {
 					output.push({
-						relative: path.relative(root, full).split(path.sep).join("/"),
+						relative,
 						full,
 						stat,
 					});
@@ -81,7 +93,7 @@ async function listFiles(ctx: ExtensionContext): Promise<NoteFile[]> {
 			}
 		}
 	}
-	await walk(root);
+	await walk(path.dirname(sentinel));
 	return output;
 }
 
@@ -116,7 +128,7 @@ async function writeAtomic(root: string, relative: string, text: string): Promis
 	const bytes = Buffer.byteLength(text);
 	if (bytes > MAX_NOTE_BYTES) throw new Error(`note exceeds ${MAX_NOTE_BYTES} bytes`);
 	const file = await ensureSafeParent(root, relative);
-	const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+	const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
 	const handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
 	try {
 		await handle.writeFile(text, "utf8");
@@ -159,12 +171,11 @@ export async function executeLocalNotes(
 	action: NotesAction,
 	params: Record<string, unknown>,
 	ctx: ExtensionContext,
+	signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
-	const root = localNotesRoot(ctx);
+	const root = localAgentsRoot(ctx);
 	if (action === "list_files_by_prefix" || action === "search_contents") {
-		let files = await listFiles(ctx);
-		const prefix = safeOptionalPrefix(action === "list_files_by_prefix" ? params.prefix : params.path_prefix);
-		files = files.filter((file) => !prefix || file.relative.startsWith(prefix));
+		const files = await listFiles(ctx, action === "list_files_by_prefix" ? params.prefix : params.path_prefix);
 		const descending = action === "search_contents"
 			? params.recent_file_first !== false
 			: params.file_order === "descending";
@@ -196,14 +207,17 @@ export async function executeLocalNotes(
 		return { matches };
 	}
 
-	const relative = safeRelativePath(params.path, "notes path");
-	const file = await ensureSafeParent(root, relative);
+	const resolved = resolveLocalNotePath(params.path, localContextIdentity(ctx).agentName);
+	const relative = resolved.relative;
+	const file = path.join(root, ...relative.split("/"));
 	if (action === "read_file") {
-		return { file: { path: relative, ...sliceLines(await readBounded(file), params.start_line, params.stop_line) } };
+		await ensureSafeParent(root, relative);
+		return { file: { path: resolved.virtual, ...sliceLines(await readBounded(file), params.start_line, params.stop_line) } };
 	}
 
 	const text = String(params.text ?? "");
 	const operation = async () => {
+		await ensureSafeParent(root, relative);
 		let next = text;
 		if (action === "append_to_file") {
 			try {
@@ -213,10 +227,11 @@ export async function executeLocalNotes(
 			}
 		}
 		const size = await writeAtomic(root, relative, next);
-		return { ok: true, file: { path: relative, size_bytes: size } };
+		return { ok: true, file: { path: resolved.virtual, size_bytes: size } };
 	};
 	const previous = queues.get(file) ?? Promise.resolve();
-	const current = previous.then(operation, operation);
+	const lockedOperation = () => withLocalFileLock(path.join(localSessionRoot(ctx), "locks"), relative, operation, signal);
+	const current = previous.then(lockedOperation, lockedOperation);
 	queues.set(file, current);
 	try {
 		return await current;

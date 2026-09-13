@@ -1,0 +1,287 @@
+diff --git a/src/agent-runner.ts b/src/agent-runner.ts
+index 6752eca..362f83a 100644
+--- a/src/agent-runner.ts
++++ b/src/agent-runner.ts
+@@ -20,6 +20,7 @@ import {
+ import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+ import { runInChildSessionContext } from "./child-context.js";
+ import { buildParentContext, extractText } from "./context.js";
++import { appendContextManagementAgentIdentity } from "./context-management-identity.js";
+ import { DEFAULT_AGENTS } from "./default-agents.js";
+ import { detectEnv } from "./env.js";
+ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+@@ -975,6 +976,10 @@ export async function runAgent(
+         })
+       : SessionManager.inMemory(effectiveCwd);
+
++  // Child sessions are separate SDK SessionManagers, so persist the root-session
++  // and stable-agent namespace context-management needs before creating the session.
++  appendContextManagementAgentIdentity(ctx.sessionManager, sessionManager, options.agentId);
++
+   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
+   // modelRuntime, but ExtensionContext still exposes only the registry facade.
+   // Pass both so the full supported Pi range retains the parent's providers.
+diff --git a/src/context-management-identity.ts b/src/context-management-identity.ts
+new file mode 100644
+index 0000000..2b39cd3
+--- /dev/null
++++ b/src/context-management-identity.ts
+@@ -0,0 +1,116 @@
++export const CONTEXT_MANAGEMENT_AGENT_IDENTITY = "context-management-agent-identity";
++const IDENTITY_VERSION = 1;
++const ROOT_AGENT_NAME = "/root";
++const MAX_AGENT_NAME_LENGTH = 1024;
++const VALID_SEGMENT = /^[A-Za-z0-9_.-]+$/;
++
++export interface ContextManagementAgentIdentity {
++  version: 1;
++  sessionId: string;
++  rootSessionId: string;
++  agentName: string;
++}
++
++type SessionManagerLike = {
++  getEntries?: () => unknown[];
++  getSessionId?: () => string;
++  appendCustomEntry?: (customType: string, data?: unknown) => unknown;
++};
++
++function isSessionId(value: unknown): value is string {
++  return typeof value === "string" && value.length > 0 && !value.includes("\0");
++}
++
++export function isValidContextManagementAgentName(value: unknown): value is string {
++  if (typeof value !== "string" || value.length === 0 || value.length > MAX_AGENT_NAME_LENGTH) return false;
++  const segments = value.split("/");
++  return segments[0] === "" && segments[1] === "root" && segments.length >= 2 && segments.slice(1).every((segment) =>
++    segment.length > 0 && VALID_SEGMENT.test(segment) && segment !== "." && segment !== ".." && segment !== "notes",
++  );
++}
++
++function parseIdentity(entry: unknown): ContextManagementAgentIdentity | undefined {
++  if (!entry || typeof entry !== "object") return undefined;
++  const custom = entry as { type?: unknown; customType?: unknown; data?: unknown };
++  if (custom.type !== "custom" || custom.customType !== CONTEXT_MANAGEMENT_AGENT_IDENTITY) return undefined;
++  if (!custom.data || typeof custom.data !== "object") return undefined;
++  const data = custom.data as Partial<ContextManagementAgentIdentity>;
++  if (
++    data.version !== IDENTITY_VERSION ||
++    !isSessionId(data.sessionId) ||
++    !isSessionId(data.rootSessionId) ||
++    !isValidContextManagementAgentName(data.agentName)
++  ) {
++    return undefined;
++  }
++  return data as ContextManagementAgentIdentity;
++}
++
++function findIdentity(manager: SessionManagerLike | undefined, sessionId: string): ContextManagementAgentIdentity | undefined {
++  try {
++    const entries = manager?.getEntries?.();
++    if (!Array.isArray(entries)) return undefined;
++    for (let index = entries.length - 1; index >= 0; index--) {
++      const identity = parseIdentity(entries[index]);
++      if (identity?.sessionId === sessionId) return identity;
++    }
++  } catch {
++    // Context identity is optional metadata; unavailable mock or host APIs must not stop a child.
++  }
++  return undefined;
++}
++
++function fallbackSegment(sessionId: string): string {
++  if (VALID_SEGMENT.test(sessionId) && sessionId !== "." && sessionId !== ".." && sessionId !== "notes") {
++    return sessionId;
++  }
++  let hash = 2166136261;
++  for (let index = 0; index < sessionId.length; index++) {
++    hash ^= sessionId.charCodeAt(index);
++    hash = Math.imul(hash, 16777619);
++  }
++  return `session-${(hash >>> 0).toString(36)}`;
++}
++
++function childAgentName(parentAgentName: string, requestedAgentId: string | undefined, childSessionId: string): string | undefined {
++  const segment = requestedAgentId && VALID_SEGMENT.test(requestedAgentId) && requestedAgentId !== "." && requestedAgentId !== ".." && requestedAgentId !== "notes"
++    ? requestedAgentId
++    : fallbackSegment(childSessionId);
++  const agentName = `${parentAgentName}/${segment}`;
++  return isValidContextManagementAgentName(agentName) ? agentName : undefined;
++}
++
++/**
++ * Persist an identity which context-management can use to place a child in its
++ * root session's history and notes namespace. This is intentionally best-effort:
++ * the SDK may give tests or embedding hosts partial SessionManager mocks.
++ */
++export function appendContextManagementAgentIdentity(
++  parentSessionManager: SessionManagerLike | undefined,
++  childSessionManager: SessionManagerLike | undefined,
++  agentId: string | undefined,
++): void {
++  try {
++    const childSessionId = childSessionManager?.getSessionId?.();
++    if (!isSessionId(childSessionId)) return;
++    if (findIdentity(childSessionManager, childSessionId)) return;
++
++    const parentSessionId = parentSessionManager?.getSessionId?.();
++    const parentIdentity = isSessionId(parentSessionId)
++      ? findIdentity(parentSessionManager, parentSessionId)
++      : undefined;
++    const rootSessionId = parentIdentity?.rootSessionId ?? (isSessionId(parentSessionId) ? parentSessionId : childSessionId);
++    const parentAgentName = parentIdentity?.agentName ?? ROOT_AGENT_NAME;
++    const agentName = childAgentName(parentAgentName, agentId, childSessionId);
++    if (!agentName || !isSessionId(rootSessionId)) return;
++
++    childSessionManager?.appendCustomEntry?.(CONTEXT_MANAGEMENT_AGENT_IDENTITY, {
++      version: IDENTITY_VERSION,
++      sessionId: childSessionId,
++      rootSessionId,
++      agentName,
++    } satisfies ContextManagementAgentIdentity);
++  } catch {
++    // Identity metadata is never allowed to make child startup fail.
++  }
++}
+diff --git a/test/context-management-identity.test.ts b/test/context-management-identity.test.ts
+new file mode 100644
+index 0000000..4abecc8
+--- /dev/null
++++ b/test/context-management-identity.test.ts
+@@ -0,0 +1,136 @@
++import { describe, expect, it, vi } from "vitest";
++import {
++  appendContextManagementAgentIdentity,
++  CONTEXT_MANAGEMENT_AGENT_IDENTITY,
++  isValidContextManagementAgentName,
++} from "../src/context-management-identity.js";
++
++type IdentityData = {
++  version: 1;
++  sessionId: string;
++  rootSessionId: string;
++  agentName: string;
++};
++
++function identity(data: IdentityData) {
++  return { type: "custom", customType: CONTEXT_MANAGEMENT_AGENT_IDENTITY, data };
++}
++
++function manager(sessionId: string, entries: unknown[] = []) {
++  return {
++    getSessionId: vi.fn(() => sessionId),
++    getEntries: vi.fn(() => entries),
++    appendCustomEntry: vi.fn(),
++  };
++}
++
++describe("context-management agent identity", () => {
++  it("places a root child in the parent's actual root session and stable agent namespace", () => {
++    const parent = manager("root-session");
++    const child = manager("child-session");
++
++    appendContextManagementAgentIdentity(parent, child, "e46f1d3a-0f4b-4da4-a0a5-77dcd0c3955a");
++
++    expect(child.appendCustomEntry).toHaveBeenCalledWith(CONTEXT_MANAGEMENT_AGENT_IDENTITY, {
++      version: 1,
++      sessionId: "child-session",
++      rootSessionId: "root-session",
++      agentName: "/root/e46f1d3a-0f4b-4da4-a0a5-77dcd0c3955a",
++    });
++  });
++
++  it("extends a valid parent identity for nested agents while retaining the root session", () => {
++    const parent = manager("parent-session", [identity({
++      version: 1,
++      sessionId: "parent-session",
++      rootSessionId: "root-session",
++      agentName: "/root/parent-agent",
++    })]);
++    const child = manager("child-session");
++
++    appendContextManagementAgentIdentity(parent, child, "nested-agent");
++
++    expect(child.appendCustomEntry).toHaveBeenCalledWith(CONTEXT_MANAGEMENT_AGENT_IDENTITY, expect.objectContaining({
++      rootSessionId: "root-session",
++      agentName: "/root/parent-agent/nested-agent",
++    }));
++  });
++
++  it("does not append duplicate metadata when a resumed child already has its own valid identity", () => {
++    const parent = manager("parent-session");
++    const child = manager("child-session", [identity({
++      version: 1,
++      sessionId: "child-session",
++      rootSessionId: "root-session",
++      agentName: "/root/existing-agent",
++    })]);
++
++    appendContextManagementAgentIdentity(parent, child, "new-agent");
++
++    expect(child.appendCustomEntry).not.toHaveBeenCalled();
++  });
++
++  it("ignores fork-copied metadata whose session id does not equal the current parent", () => {
++    const parent = manager("fork-session", [identity({
++      version: 1,
++      sessionId: "original-session",
++      rootSessionId: "root-session",
++      agentName: "/root/original-agent",
++    })]);
++    const child = manager("child-session");
++
++    appendContextManagementAgentIdentity(parent, child, "child-agent");
++
++    expect(child.appendCustomEntry).toHaveBeenCalledWith(CONTEXT_MANAGEMENT_AGENT_IDENTITY, expect.objectContaining({
++      rootSessionId: "fork-session",
++      agentName: "/root/child-agent",
++    }));
++  });
++
++  it("creates an independent root identity when there is no parent context", () => {
++    const child = manager("standalone-session");
++
++    appendContextManagementAgentIdentity(undefined, child, "standalone-agent");
++
++    expect(child.appendCustomEntry).toHaveBeenCalledWith(CONTEXT_MANAGEMENT_AGENT_IDENTITY, expect.objectContaining({
++      rootSessionId: "standalone-session",
++      agentName: "/root/standalone-agent",
++    }));
++  });
++
++  it("does not make memory-like or incomplete SessionManager mocks fail child startup", () => {
++    expect(() => appendContextManagementAgentIdentity(
++      { getSessionId: () => "parent" },
++      { getSessionId: () => "child" },
++      "agent",
++    )).not.toThrow();
++    expect(() => appendContextManagementAgentIdentity(
++      undefined,
++      { appendCustomEntry: vi.fn() },
++      "agent",
++    )).not.toThrow();
++  });
++
++  it("rejects unsafe paths and invalid root ids, then falls back from an invalid agent id", () => {
++    expect(isValidContextManagementAgentName("/root/agent_1")).toBe(true);
++    expect(isValidContextManagementAgentName("/root/notes")).toBe(false);
++    expect(isValidContextManagementAgentName("/root/../agent")).toBe(false);
++    expect(isValidContextManagementAgentName("root/agent")).toBe(false);
++    expect(isValidContextManagementAgentName("/other/agent")).toBe(false);
++    expect(isValidContextManagementAgentName(`/root/${"a".repeat(1020)}`)).toBe(false);
++
++    const parent = manager("parent-session", [identity({
++      version: 1,
++      sessionId: "parent-session",
++      rootSessionId: "root\0session",
++      agentName: "/root/notes",
++    })]);
++    const child = manager("safe-child-id");
++    appendContextManagementAgentIdentity(parent, child, "../../display-name");
++
++    expect(child.appendCustomEntry).toHaveBeenCalledWith(CONTEXT_MANAGEMENT_AGENT_IDENTITY, expect.objectContaining({
++      rootSessionId: "parent-session",
++      agentName: "/root/safe-child-id",
++    }));
++  });
++});

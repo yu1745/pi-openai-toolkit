@@ -1,10 +1,11 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { localHistoryDatabasePath } from "./local-paths";
+import { localContextIdentity, resolveAgentName } from "./local-identity";
 import { projectHistoryEntries } from "./history-projector";
 import { loadSessionSnapshots } from "./history-source";
 import {
 	openHistoryDatabase,
-	removeDeletedSources,
+	removeHistorySource,
 	synchronizeSnapshot,
 	type HistoryDatabase,
 } from "./history-store";
@@ -36,17 +37,15 @@ function bounded(value: unknown, fallback: number, maximum: number): number {
 async function synchronizedDatabase(ctx: ExtensionContext): Promise<HistoryDatabase> {
 	const database = await openHistoryDatabase(localHistoryDatabasePath(ctx));
 	try {
-		const snapshots = await loadSessionSnapshots(ctx);
-		const retained = new Set<string>();
+		const { snapshots, missingFiles } = await loadSessionSnapshots(ctx);
 		for (const snapshot of snapshots) {
-			retained.add(snapshot.filePath);
 			synchronizeSnapshot(
 				database,
 				snapshot,
-				projectHistoryEntries(snapshot.entries, snapshot.sessionId, snapshot.filePath),
+				projectHistoryEntries(snapshot.entries, snapshot.sessionId, snapshot.filePath, snapshot.agentName),
 			);
 		}
-		removeDeletedSources(database, retained, snapshots[0]?.sourceRoot);
+		for (const file of missingFiles) removeHistorySource(database, file);
 		return database;
 	} catch (error) {
 		database.close();
@@ -54,11 +53,16 @@ async function synchronizedDatabase(ctx: ExtensionContext): Promise<HistoryDatab
 	}
 }
 
-function filters(params: Record<string, unknown>, alias = "e") {
-	const clauses: string[] = [];
-	const values: unknown[] = [];
+/** Snapshot live SDK sessions before their extension instance shuts down. */
+export async function checkpointLocalHistory(ctx: ExtensionContext): Promise<void> {
+	const database = await synchronizedDatabase(ctx);
+	database.close();
+}
+
+function filters(params: Record<string, unknown>, agentName: string, alias = "e") {
+	const clauses: string[] = [`${alias}.agent_name = ?`];
+	const values: unknown[] = [agentName];
 	for (const [field, column] of [
-		["agent_name", "agent_name"],
 		["window_id", "window_id"],
 		["role", "role"],
 		["tool_name", "tool_name"],
@@ -91,10 +95,11 @@ export async function executeLocalHistory(
 	params: Record<string, unknown>,
 	ctx: ExtensionContext,
 ): Promise<Record<string, unknown>> {
+	const agentName = resolveAgentName(params.agent_name, localContextIdentity(ctx).agentName);
 	const database = await synchronizedDatabase(ctx);
 	try {
 		if (action === "list_windows") {
-			const where = filters(params);
+			const where = filters(params, agentName);
 			const direction = params.recent_first === false ? "ASC" : "DESC";
 			const rows = database.prepare(`SELECT window_id AS id, session_id, agent_name,
 				MIN(timestamp) AS created_at, COUNT(*) AS item_count
@@ -104,8 +109,8 @@ export async function executeLocalHistory(
 			return { windows: rows };
 		}
 		if (action === "read_item") {
-			const rows = database.prepare("SELECT * FROM entries WHERE entry_id = ? AND window_id = ? ORDER BY timestamp")
-				.all(params.item_id, params.window_id) as Row[];
+			const rows = database.prepare("SELECT * FROM entries WHERE entry_id = ? AND window_id = ? AND agent_name = ? ORDER BY timestamp")
+				.all(params.item_id, params.window_id, agentName) as Row[];
 			if (rows.length === 0) throw new Error("history item not found in the requested window");
 			if (rows.length !== 1) {
 				throw new Error("history item id is ambiguous in the requested window; select a unique window/item pair");
@@ -123,7 +128,7 @@ export async function executeLocalHistory(
 			};
 		}
 
-		const where = filters(params);
+		const where = filters(params, agentName);
 		const direction = params.recent_first === false ? "ASC" : "DESC";
 		const limit = bounded(params.limit, 100, MAX_RESULTS);
 		if (action === "list_items") {
@@ -134,20 +139,12 @@ export async function executeLocalHistory(
 			return { items: rows.map((row) => publicItem(row, maximum)) };
 		}
 
-		const query = String(params.query);
-		const ftsQuery = `"${query.replaceAll('"', '""')}"`;
-		const suffix = where.sql ? ` AND ${where.sql.slice(" WHERE ".length)}` : "";
-		const candidates = database.prepare(`SELECT e.* FROM entries_fts f
-			JOIN entries e ON e.entry_key = f.entry_key
-			WHERE entries_fts MATCH ?${suffix}
+		// FTS token/phrase matching is not literal substring matching (e.g. "pha" in "alpha").
+		// Apply the exact, case-sensitive predicate before LIMIT; never silently lose candidates.
+		const rows = database.prepare(`SELECT e.* FROM entries e${where.sql} AND instr(e.text, ?) > 0
 			ORDER BY e.timestamp ${direction}, e.sequence ${direction} LIMIT ?`)
-			.all(ftsQuery, ...where.values, limit * 4) as Row[];
-		return {
-			matches: candidates
-				.filter((row) => row.text.includes(query))
-				.slice(0, limit)
-				.map((row) => publicItem(row)),
-		};
+			.all(...where.values, String(params.query), limit) as Row[];
+		return { matches: rows.map((row) => publicItem(row)) };
 	} finally {
 		database.close();
 	}

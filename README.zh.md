@@ -67,7 +67,7 @@ pi --model openai-codex/<model-id>
 
 ### 使用其他服务商或网关
 
-设置 `contextManagement: "auto"` 后，除原生 `openai-codex` 外的所有服务商都使用本地上下文后端，不需要透传 Codex alpha headers 或 encrypted tool output。本地 Notes 使用按项目隔离的安全文件树；本地 History 以 Pi session JSONL 为 source of truth，并维护可删除重建、增量同步的 SQLite/FTS5 索引。Git 项目现在按仓库 common Git directory 的哈希识别，因此主 checkout、linked worktree 与仓库内 nested cwd 共用同一身份，而 submodule 保持独立。非 Git 目录，以及 Git 探测失败或超时的情况，仍完全回退到原有 canonical cwd 哈希行为。
+设置 `contextManagement: "auto"` 后，除原生 `openai-codex` 外的所有服务商都使用本地上下文后端，不需要透传 Codex alpha headers 或 encrypted tool output。本地 Notes 与 History 按 **根任务/session** 隔离，再按 Agent Name 命名；不再默认共享同项目其他会话的数据。显式关联的子代理即使使用其他 cwd/worktree，也属于同一根任务。主代理默认为 `/root`；子代理身份须由宿主传递，不能从项目路径、显示名或 `parentSession` 猜测。详见[本地与远程对齐范围](docs/context-management-parity.md)。
 
 如果 `~/.pi/agent/models.json` 中已有符合上述条件的网关模型，可以跳过模型配置，直接设置扩展白名单。否则，先添加或合并下面的提供商配置。请把 `my-gateway`、地址、环境变量名称和模型字段替换成实际值。示例中的数字只是示意值，不是项目默认值，必须改成符合实际模型与网关能力的上下文窗口和最大输出 token 数。
 
@@ -199,11 +199,14 @@ pi --model my-gateway/gpt-5.6-luna
 
 本地 Context 数据位于 `~/.pi/agent/extensions/pi-openai-toolkit/context-management/`：
 
-- `notes/<project-key>/` 保存 Notes。`<project-key>` 现在使用上述 Git common-directory 身份哈希；无法探测 Git 时使用 canonical-cwd 哈希。旧版本按 cwd/worktree key 创建的 Notes 目录**不会**被自动迁移、删除或覆盖；只有在核对新旧目录后才应手动复制。
-- `history/<project-key>.sqlite` 是可从 Pi session JSONL 重建的 SQLite/FTS5 临时索引。linked worktree 的多个 session 目录共享该索引，同步时只会删除当前正在扫描的 session 目录中的过期 source。
+- `sessions/<root-session-key>/agents/root/notes/` 保存主代理 Notes；子代理使用 `agents/root/<agent-id>/notes/`。`<root-session-key>` 是根 Pi session ID 的 SHA-256，与项目路径无关。
+- 相对路径 `state.md` 指当前代理的笔记；虚拟绝对路径 `/root/<agent-id>/notes/state.md` 可跨代理读写，但始终限定同一根 session。省略列表/搜索前缀时只查当前代理。
+- `sessions/<root-session-key>/sources/` 记录显式注册的 session 来源；`history.sqlite` 索引这些来源的历史。持久化 Pi JSONL 是可重建来源，不扫描整个项目或全局会话目录。SDK 内存会话可即时读取，关闭时尽力保存索引快照，但其历史不能保证在索引重建后恢复。
+- `history` 默认查询当前代理，`agent_name` 可用绝对路径或当前代理下的相对路径；所有操作（包括 `read_item`）均遵守该范围。`search_contents` 保持大小写敏感的字面子串匹配。
+- 旧 `notes/<project-key>/` 和 `history/<project-key>.sqlite` **保留原样，不读取、不自动迁移、不删除**。如需带入旧笔记，应核对目标任务后显式复制。普通 `/new`、`/fork` 是新范围；恢复同一 session 则继续原范围。
 - `status/<project-key>/<session-key>/latest.json` 是每个 session 的 best-effort 最新状态，采用原子替换，大小上限为 16 KiB，文件权限为 `0600`（目录 `0700`），不会按 turn 无限增长。
 
-状态中包含 backend 与 active、哈希后的项目 identity kind/key、窗口 id/number 与 initialized/restored、剩余预算和已配置提醒阈值、reminder/fallback 状态、成功 Notes checkpoint 的大小（可获得时）、rollover 结果以及恢复状态。`get_context_remaining` 保持原有首句和 token 字段不变，并在 `details.status` 中返回这些状态。
+诊断用的项目 identity 仍按 Git common directory（失败时 canonical cwd）计算，但不再用于 Notes/History 的访问范围。状态中包含 backend 与 active、哈希后的项目 identity kind/key、窗口 id/number 与 initialized/restored、剩余预算和已配置提醒阈值、reminder/fallback 状态、成功 Notes checkpoint 的大小（可获得时）、rollover 结果以及恢复状态。`get_context_remaining` 保持原有首句和 token 字段不变，并在 `details.status` 中返回这些状态。
 
 状态采集只在本地进行，绝不写入 Notes 正文、prompt、凭证、encrypted output 或 cwd/session 文件路径。所有写入都是 best-effort；observer 失败不会阻断请求或上下文切换。启用 `compaction.debug: true` 后，同样不含正文的状态转换也会写入详细 lifecycle artifact；这些生命周期事件不包含 Notes 或 prompt 正文。provider payload artifact 仍由单独的显式 payload 日志选项控制。
 

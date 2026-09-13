@@ -71,7 +71,11 @@ export class CodexContextWindowManager {
 	private restoredFallback = false;
 	private restoredNotes: { success: boolean; sizeBytes?: number } = { success: false };
 
-	constructor(loadThreadHint?: ThreadHintLoader, lifecycleWriter?: LifecycleWriter) {
+	constructor(
+		loadThreadHint?: ThreadHintLoader,
+		lifecycleWriter?: LifecycleWriter,
+		private readonly agentNameForContext: (ctx: ExtensionContext) => string = () => "/root",
+	) {
 		this.loadThreadHint = loadThreadHint ?? ((ctx, signal) => loadHistoryNotesThreadHint(ctx, signal));
 		this.observer = new ContextStatusObserver(lifecycleWriter);
 	}
@@ -407,7 +411,7 @@ export class CodexContextWindowManager {
 	): void {
 		sendContextWindowMessage(
 			pi,
-			renderContextWindowMessage(identity, threadHint),
+			renderContextWindowMessage(identity, threadHint, this.agentNameForContext(ctx)),
 			"window",
 			identity,
 			{ triggerTurn: options.triggerTurn, sessionId: ctx.sessionManager.getSessionId() },
