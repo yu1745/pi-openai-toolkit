@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { CONFIG_PATH, loadToolkitConfig } from "./config";
 import {
 	DEFAULT_AUTO_MODE_CONFIG,
+	DEFAULT_CODEX_CONTEXT_MODELS,
 	DEFAULT_COMPACTION_CONFIG,
 	DEFAULT_IMAGE_GENERATION_CONFIG,
 	DEFAULT_NATIVE_FALLBACK_CONFIG,
@@ -37,7 +38,7 @@ describe("loadToolkitConfig", () => {
 
 	test("missing file yields independent defaults without warnings", () => {
 		const missingPath = path.join(os.tmpdir(), "pi-openai-toolkit-missing", "config.json");
-		const loaded = loadToolkitConfig(missingPath);
+		const loaded = loadToolkitConfig(missingPath, `${missingPath}.settings.json`);
 
 		expect(loaded.source).toBeUndefined();
 		expect(loaded.warnings).toEqual([]);
@@ -50,7 +51,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.compaction.responsesApis).toEqual([
 			...DEFAULT_COMPACTION_CONFIG.responsesApis,
 		]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
 		expect(loaded.config.webSearch).toEqual({
 			...DEFAULT_WEB_SEARCH_CONFIG,
 			models: [...DEFAULT_WEB_SEARCH_CONFIG.models],
@@ -112,7 +113,7 @@ describe("loadToolkitConfig", () => {
 			}),
 		);
 
-		const loaded = loadToolkitConfig(configPath);
+		const loaded = loadToolkitConfig(configPath, path.join(path.dirname(configPath), "settings.json"));
 
 		expect(loaded.source).toBe(configPath);
 		expect(loaded.warnings).toEqual([]);
@@ -159,6 +160,22 @@ describe("loadToolkitConfig", () => {
 			circuitBreaker: { consecutiveDenials: 4, recentDenials: 12, windowSize: 40 },
 		});
 		expect(loaded.config).not.toHaveProperty("codexAstra");
+	});
+
+	test("reads the hosted native Codex allowlist from settings without rewriting it", () => {
+		const configPath = writeTempConfig(JSON.stringify({
+			compaction: { gatewayContextModels: ["ignored/config-value"] },
+		}));
+		const settingsPath = path.join(path.dirname(configPath), "settings.json");
+		const settings = JSON.stringify({
+			openaiToolkit: { codexContextModels: ["openai-codex/gpt-5.6-sol"] },
+			otherSetting: true,
+		}, null, 2) + "\n";
+		fs.writeFileSync(settingsPath, settings, "utf8");
+
+		const loaded = loadToolkitConfig(configPath, settingsPath);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual(["openai-codex/gpt-5.6-sol"]);
+		expect(fs.readFileSync(settingsPath, "utf8")).toBe(settings);
 	});
 
 	test("a retired codexAstra section warns as an unknown field without crashing", () => {
@@ -321,7 +338,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.compaction.nativeFallback).toEqual({ ...DEFAULT_NATIVE_FALLBACK_CONFIG });
 		expect(loaded.config.compaction).not.toHaveProperty("autoCompaction");
 		expect(loaded.config.compaction.responsesApis).toEqual(["openai-responses"]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
 		expect(loaded.config.webSearch).toEqual({ enabled: true, models: ["provider/model"] });
 		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["gpt-image-2.5"] });
 		expect(loaded.config.autoMode).toEqual({

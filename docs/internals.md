@@ -12,14 +12,15 @@ Developer-facing reference for [pi-openai-toolkit](../README.md). If changing co
 
 ## Local Context protocol
 
-With `compaction.contextManagement: "auto"`, every provider, including native `openai-codex`, uses the local history/notes and context-window implementation.
+With `compaction.contextManagement: "auto"`, routing is hybrid. Native `openai-codex` models listed in `settings.json` `openaiToolkit.codexContextModels` use the hosted history/notes and no-summary rolling-window transport. Non-Codex providers use the local implementation below. Native Codex models outside that allowlist have context management off and retain the independent Remote Compaction v2/replay path.
 
-- `history` indexes explicitly registered Pi session sources in task-scoped SQLite and returns only the selected agent scope.
-- `notes` reads and writes task- and agent-scoped virtual files under the local context-management root.
-- Window boundaries are local `codex-context-window` custom messages. They trim prior windows from the live prompt without emitting hosted window metadata or headers.
+- `history` indexes explicitly registered Pi session sources in task-scoped SQLite and returns only the selected agent scope on the local backend.
+- `notes` reads and writes task- and agent-scoped virtual files under the local context-management root on the local backend.
+- Local window boundaries are `codex-context-window` custom messages. They trim prior windows without hosted window metadata or headers.
 - The local payload path uses unencrypted namespace schemas. It retains normal model reasoning items. Opaque encrypted history/notes records from a prior hosted session are replaced with an omission marker instead of being forwarded as local content.
+- Hosted native Codex transport uses its reserved encrypted namespace schema, hosted window metadata/headers, and the remote thread hint. No local history source is registered or checkpointed on that path.
 
-No active context-management path resolves Codex OAuth, calls an alpha history/notes endpoint, sends hosted context headers, or rewrites tool output into `encrypted_content`. `gatewayContextModels` is legacy configuration only and does not select a context backend. Existing remote helper modules remain compatibility utilities; remote context-data migration is not provided.
+The runtime resolves Codex OAuth and calls alpha history/notes only for allowlisted native Codex transport. Existing remote data migration into local storage is not provided.
 
 ## Rollover lifecycle
 

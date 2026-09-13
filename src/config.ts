@@ -18,6 +18,7 @@ import {
 	CLASSIFIER_MAX_LAG_MAX,
 	CLASSIFIER_MAX_LAG_MIN,
 	DEFAULT_CLASSIFIER_TIMEOUT_MS,
+	DEFAULT_CODEX_CONTEXT_MODELS,
 	EVIDENCE_ROUNDS_MAX,
 	EVIDENCE_ROUNDS_MIN,
 	REVIEWER_TIMEOUT_MAX_MS,
@@ -150,7 +151,7 @@ function toContextManagementMode(
 		if (normalized === "off" || normalized === "auto") return normalized;
 		// Migrate the previously supported enabled value without rewriting user config.
 		if (normalized === "remote") {
-			warnings.push(`Migrating ${fieldPath}=remote to auto; context management now uses the local backend for every provider.`);
+			warnings.push(`Migrating ${fieldPath}=remote to auto; context management now uses hybrid provider routing.`);
 			return "auto";
 		}
 	}
@@ -528,6 +529,25 @@ function applyAutoModeClassifierConfig(
 	}
 }
 
+function loadCodexContextModelsFromSettings(
+	settingsPath: string,
+	warnings: string[],
+): string[] | undefined {
+	try {
+		if (!isFile(settingsPath)) return undefined;
+		const raw = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+		if (!isRecord(raw) || !isRecord(raw.openaiToolkit)) return [...DEFAULT_CODEX_CONTEXT_MODELS];
+		const models = raw.openaiToolkit.codexContextModels;
+		return models === undefined || models === null
+			? [...DEFAULT_CODEX_CONTEXT_MODELS]
+			: toStringList(models, "openaiToolkit.codexContextModels", warnings);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		warnings.push(`Ignoring ${settingsPath}: ${message}`);
+		return undefined;
+	}
+}
+
 function applyAutoModeBreakerConfig(
 	raw: Record<string, unknown>,
 	resolved: AutoModeCircuitBreakerConfig,
@@ -620,9 +640,10 @@ export function loadToolkitConfig(
 		}
 	}
 
-	// Context management no longer consults or mutates settings.json. The legacy
-	// parameter remains for API compatibility with callers of loadToolkitConfig.
-	void settingsPath;
+	const settingsModels = loadCodexContextModelsFromSettings(settingsPath, warnings);
+	if (settingsModels !== undefined) {
+		resolved.compaction.gatewayContextModels = settingsModels;
+	}
 
 	resolved.compaction.artifactRoot = resolveConfiguredPath(
 		resolved.compaction.artifactRoot,

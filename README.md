@@ -45,7 +45,7 @@ This section is for users who want Codex-style context windows. If you only want
 
 ### Use any configured Pi model
 
-Context Management is local for every provider, including Pi's native `openai-codex` models. It has no separate context-backend authentication requirement; normal model inference still uses the provider authentication configured in Pi.
+Context Management uses hybrid routing. Allowlisted native `openai-codex` models use hosted history/notes and no-summary rolling windows; other providers use the local backend. Native Codex models outside the rolling-window allowlist keep Context Management off and use the independent Remote Compaction v2 path. Normal model inference always uses the provider authentication configured in Pi.
 
 Create or merge this extension config:
 
@@ -63,7 +63,9 @@ Start Pi with any model already configured in Pi, for example:
 pi --model openai-codex/<model-id>
 ```
 
-The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools. With `contextManagement: "auto"`, all providers use the local backend: no Codex alpha history/notes request, hosted context header, or encrypted tool-output rewrite is used. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local context parity](docs/context-management-parity.md).
+The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools. With `contextManagement: "auto"`, non-Codex providers use the local backend: no Codex alpha history/notes request, hosted context header, or encrypted tool-output rewrite is used. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local context parity](docs/context-management-parity.md).
+
+The hosted rolling-window allowlist is read without modification from `~/.pi/agent/settings.json` at `openaiToolkit.codexContextModels`. Its defaults are `openai-codex/gpt-6-astra` and `openai-codex/gpt-5.6-sol`. Only allowlisted native Codex models receive the hosted transport; an unlisted native Codex model deliberately receives no context-management tools or window ownership.
 
 ### Use another provider or gateway
 
@@ -125,7 +127,7 @@ Earlier windows remain available through `history`, but they are not all automat
 
 ### Continue a session with server-side compaction
 
-Set Context Management to `"off"` when you want the Responses compaction path instead. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
+Set Context Management to `"off"` when you want the Responses compaction path instead. Unallowlisted native Codex models also use this independent Remote Compaction v2 path while `contextManagement` is `"auto"`; they do not receive no-summary rolling windows. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
 
 ### Enable hosted Web Search
 
@@ -180,8 +182,8 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | Key | Default | Use |
 | --- | --- | --- |
 | `compaction.enabled` | `true` | Master switch for compaction. |
-| `compaction.contextManagement` | `"off"` | `"auto"` uses the local history/notes and context-window backend for every provider, including native `openai-codex`. Unknown values fail closed. |
-| `compaction.gatewayContextModels` | `[]` | Legacy compatibility field; it does not select context transport. |
+| `compaction.contextManagement` | `"off"` | `"auto"` routes allowlisted native `openai-codex` models to hosted rolling windows, non-Codex providers to local history/notes and windows, and unallowlisted native Codex models to independent Remote Compaction v2. Unknown values fail closed. |
+| `compaction.gatewayContextModels` | `openai-codex/gpt-6-astra`, `openai-codex/gpt-5.6-sol` | Hosted native-Codex rolling-window allowlist; synchronized from `settings.json` `openaiToolkit.codexContextModels` when present. |
 | `compaction.remoteCompactModel` | unset | Optional model used only for a v2 compaction request. |
 | `compaction.contextReminderThresholdPercent` | `5` | Remaining budget percentage for the once-per-window reminder. `0` disables the reminder and exhausted-window fallback. |
 | `webSearch.models` | `[]` | Models that receive hosted Web Search. |

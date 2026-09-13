@@ -45,7 +45,7 @@ pi install npm:pi-openai-toolkit
 
 ### 使用任意已配置的 Pi 模型
 
-所有提供商（包括 Pi 原生 `openai-codex`）都使用本地上下文管理。它不需要单独的上下文后端认证；普通模型推理仍使用 Pi 已配置的提供商认证。
+上下文管理采用混合路由：白名单中的原生 `openai-codex` 模型使用托管 history/notes 和无摘要滚动窗口；其他服务商使用本地后端。未列入滚动窗口白名单的原生 Codex 模型保持上下文管理关闭，并走独立的远程压缩 v2 路径。普通模型推理仍使用 Pi 已配置的提供商认证。
 
 创建或合并扩展配置：
 
@@ -63,7 +63,9 @@ pi install npm:pi-openai-toolkit
 pi --model openai-codex/<model-id>
 ```
 
-会话中出现 `new_context`、`get_context_remaining`、`history` 和 `notes` 工具，说明扩展已经完成启用检查。设置 `contextManagement: "auto"` 后，所有服务商都使用本地后端：不会调用 Codex alpha history/notes、写入托管上下文 header 或重写 encrypted tool output。本地 Notes 与 History 按 **根任务/session** 隔离，再按 Agent Name 命名；不再默认共享同项目其他会话的数据。显式关联的子代理即使使用其他 cwd/worktree，也属于同一根任务。主代理默认为 `/root`；子代理身份须由宿主传递，不能从项目路径、显示名或 `parentSession` 猜测。详见[本地上下文对齐范围](docs/context-management-parity.md)。
+会话中出现 `new_context`、`get_context_remaining`、`history` 和 `notes` 工具，说明扩展已经完成启用检查。设置 `contextManagement: "auto"` 后，非 Codex 服务商使用本地后端：不会调用 Codex alpha history/notes、写入托管上下文 header 或重写 encrypted tool output。本地 Notes 与 History 按 **根任务/session** 隔离，再按 Agent Name 命名；不再默认共享同项目其他会话的数据。显式关联的子代理即使使用其他 cwd/worktree，也属于同一根任务。主代理默认为 `/root`；子代理身份须由宿主传递，不能从项目路径、显示名或 `parentSession` 猜测。详见[本地上下文对齐范围](docs/context-management-parity.md)。
+
+托管滚动窗口白名单从 `~/.pi/agent/settings.json` 的 `openaiToolkit.codexContextModels` 只读读取，不会修改该文件。默认值为 `openai-codex/gpt-6-astra` 和 `openai-codex/gpt-5.6-sol`。只有白名单中的原生 Codex 模型使用托管传输；未列入白名单的原生 Codex 模型不会获得上下文管理工具或窗口所有权。
 
 ### 使用其他服务商或网关
 
@@ -125,7 +127,7 @@ pi --model my-gateway/gpt-5.6-luna
 
 ### 使用服务端压缩继续会话
 
-如果希望使用 Responses 压缩路径，就将上下文管理设为 `"off"`。远程压缩 v2 会为符合条件的 Responses 模型保存并回放加密检查点。只有在压缩请求需要使用其他模型时，才设置 `compaction.remoteCompactModel`。
+如果希望使用 Responses 压缩路径，就将上下文管理设为 `"off"`。在 `contextManagement: "auto"` 下，未列入白名单的原生 Codex 模型也会走这个独立的远程压缩 v2 路径，而不会获得无摘要滚动窗口。远程压缩 v2 会为符合条件的 Responses 模型保存并回放加密检查点。只有在压缩请求需要使用其他模型时，才设置 `compaction.remoteCompactModel`。
 
 ### 启用托管联网搜索
 
@@ -180,8 +182,8 @@ pi --model my-gateway/gpt-5.6-luna
 | 配置项 | 默认值 | 用途 |
 | --- | --- | --- |
 | `compaction.enabled` | `true` | 压缩功能总开关。 |
-| `compaction.contextManagement` | `"off"` | `"auto"`：所有服务商（包括原生 `openai-codex`）都使用本地 history/notes 与上下文窗口后端；未知值按关闭处理。 |
-| `compaction.gatewayContextModels` | `[]` | 旧配置兼容字段；不再选择上下文传输。 |
+| `compaction.contextManagement` | `"off"` | `"auto"`：白名单原生 `openai-codex` 模型使用托管滚动窗口，非 Codex 服务商使用本地 history/notes 与上下文窗口，未列入白名单的原生 Codex 模型使用独立的远程压缩 v2；未知值按关闭处理。 |
+| `compaction.gatewayContextModels` | `openai-codex/gpt-6-astra`、`openai-codex/gpt-5.6-sol` | 托管原生 Codex 滚动窗口白名单；存在时从 `settings.json` 的 `openaiToolkit.codexContextModels` 同步。 |
 | `compaction.remoteCompactModel` | 未设置 | 仅用于 v2 压缩请求的可选模型。 |
 | `compaction.contextReminderThresholdPercent` | `5` | 每个窗口触发一次提醒的剩余预算百分比。设置为 `0` 会关闭提醒和窗口耗尽兜底。 |
 | `webSearch.models` | `[]` | 使用托管联网搜索的模型。 |

@@ -25,7 +25,6 @@ export const CODEX_CONTEXT_PROVIDER_ERROR =
 
 export function isNativeCodexModel(
 	model: ExtensionContext["model"] | undefined,
-	allowedModels: readonly string[] = [],
 ): boolean {
 	return model?.provider === CODEX_PROVIDER && model.api === CODEX_API;
 }
@@ -185,7 +184,7 @@ export async function resolveCodexContextProvider(
 	};
 	if (!model) return { ok: false, reason: "unsupported-model" };
 
-	const isNative = isNativeCodexModel(model, gatewayModels);
+	const isNative = isNativeCodexModel(model);
 	const isGateway = isCodexGatewayModel(model, gatewayModels);
 	if (!isNative && !isGateway) {
 		return { ok: false, reason: "unsupported-model", ...descriptor };

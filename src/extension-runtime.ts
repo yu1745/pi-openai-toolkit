@@ -7,6 +7,12 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { loadToolkitConfig } from "./config";
+import {
+	codexContextProviderHeaders,
+	isNativeCodexModel,
+	resolveCodexContextProvider,
+} from "./context-management/codex-provider";
+import { loadHistoryNotesThreadHint } from "./context-management/history-notes";
 import { routeContextNamespaceToolMessage } from "./context-management/namespace-tools";
 import { loadLocalThreadHint } from "./context-management/local-backend";
 import { registerLocalHistorySource, unregisterLocalHistorySource } from "./context-management/history-source";
@@ -15,6 +21,7 @@ import { localContextIdentity } from "./context-management/local-identity";
 import { CodexContextWindowManager } from "./context-management/window-manager";
 import { registerContextManagementTools } from "./context-management/tools";
 import { writeDebugArtifact, writeReplayFailureArtifact } from "./debug";
+import { isExactModelAllowed } from "./model-scope";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
 import { runNativeFallbackCompaction } from "./native-fallback";
 import {
@@ -48,7 +55,7 @@ type CompactionDependencies = {
 	contextWindows: CodexContextWindowManager;
 };
 
-type LocalContextActive = (
+type ContextActive = (
 	ctx: ExtensionContext,
 	config: CompactionConfig,
 	model?: ExtensionContext["model"],
@@ -101,17 +108,38 @@ function notifyWarning(ctx: ExtensionContext, message: string): void {
 	}
 }
 
-async function isLocalContextActive(
-	_ctx: ExtensionContext,
+function isAllowlistedNativeCodexContextModel(
+	model: ExtensionContext["model"] | undefined,
 	config: CompactionConfig,
-	_model?: ExtensionContext["model"],
-): Promise<boolean> {
-	return config.enabled && config.contextManagement !== "off";
+): boolean {
+	return isNativeCodexModel(model) && isExactModelAllowed(model, config.gatewayContextModels);
 }
 
-function notifyLocalContextFailure(ctx: ExtensionContext, reason: string): void {
+function selectedContextBackend(
+	config: CompactionConfig,
+	model: ExtensionContext["model"] | undefined,
+): "off" | "remote" | "local" {
+	if (!config.enabled || config.contextManagement === "off" || !model) return "off";
+	if (isNativeCodexModel(model)) {
+		return isAllowlistedNativeCodexContextModel(model, config) ? "remote" : "off";
+	}
+	return "local";
+}
+
+async function isContextActive(
+	ctx: ExtensionContext,
+	config: CompactionConfig,
+	model: ExtensionContext["model"] = ctx.model,
+): Promise<boolean> {
+	const backend = selectedContextBackend(config, model);
+	if (backend === "off") return false;
+	if (backend === "local") return true;
+	return (await resolveCodexContextProvider(ctx, model, config.gatewayContextModels)).ok;
+}
+
+function notifyContextFailure(ctx: ExtensionContext, reason: string): void {
 	if (ctx.hasUI) {
-		ctx.ui.notify(`${COMPACTION_EXTENSION_ID}: Local context management inactive (${reason})`, "warning");
+		ctx.ui.notify(`${COMPACTION_EXTENSION_ID}: Context management inactive (${reason})`, "warning");
 	}
 }
 
@@ -327,7 +355,7 @@ async function handleSessionBeforeCompact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 	dependencies: CompactionDependencies,
-	localContextActive: LocalContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: toolkitConfig } = dependencies.loadConfig();
 	const config = toolkitConfig.compaction;
@@ -356,16 +384,23 @@ async function handleSessionBeforeCompact(
 		return { cancel: true };
 	}
 
-	// Local context management owns only a scheduled window rollover. Other
-	// compactions retain the existing remote-v2/native-fallback behavior.
-	if (config.contextManagement !== "off" && await localContextActive(ctx, config)) {
+	// Context windows own only a scheduled rollover. Other compactions retain
+	// the existing remote-v2/native-fallback behavior.
+	if (config.contextManagement !== "off" && await contextActive(ctx, config)) {
 		try {
 			dependencies.contextWindows.synchronize(ctx);
 			return dependencies.contextWindows.prepareCompaction(event);
 		} catch {
-			notifyLocalContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 			return { cancel: true };
 		}
+	}
+
+	// An allowlisted native Codex session owns its no-summary window lifecycle.
+	// If hosted authentication or tool ownership is unavailable, never replay it
+	// through the incompatible remote_compaction_v2 transport.
+	if (config.contextManagement !== "off" && isAllowlistedNativeCodexContextModel(ctx.model, config)) {
+		return { cancel: true };
 	}
 
 	// Branch 1: Responses-family APIs use remote_compaction_v2 on the normal Responses stream.
@@ -473,7 +508,7 @@ async function handleContext(
 	pi: ExtensionAPI,
 	loadConfig: typeof loadToolkitConfig,
 	contextWindows: CodexContextWindowManager,
-	localContextActive: LocalContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: { compaction: config } } = loadConfig();
 	if (!config.enabled) {
@@ -487,28 +522,37 @@ async function handleContext(
 		try {
 			contextWindows.synchronize(ctx);
 		} catch {
-			notifyLocalContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 			ctx.abort();
 			return undefined;
 		}
 
-		if (await localContextActive(ctx, config)) {
+		if (await contextActive(ctx, config)) {
 			try {
+				const backend = selectedContextBackend(config, ctx.model);
 				contextWindows.recordBudget(
 					pi,
 					ctx,
 					true,
 					config.contextReminderThresholdPercent,
 				);
-				const projected = contextWindows.project(event.messages, "local");
+				const projected = contextWindows.project(event.messages, backend);
 				return projected.length === event.messages.length && projected.every((message, index) => message === event.messages[index])
 					? undefined
 					: { messages: projected };
 			} catch {
-				notifyLocalContextFailure(ctx, "malformed-window-state");
+				notifyContextFailure(ctx, "malformed-window-state");
 				ctx.abort();
 				return undefined;
 			}
+		}
+
+		// A failed allowlisted hosted session must not enter compaction replay.
+		if (isAllowlistedNativeCodexContextModel(ctx.model, config)) {
+			const visibleMessages = contextWindows.project(event.messages, "off");
+			return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
+				? undefined
+				: { messages: visibleMessages };
 		}
 	}
 
@@ -539,7 +583,7 @@ async function handleBeforeProviderRequest(
 	ctx: ExtensionContext,
 	loadConfig: typeof loadToolkitConfig,
 	contextWindows: CodexContextWindowManager,
-	localContextActive: LocalContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: toolkitConfig } = loadConfig();
 	const config = toolkitConfig.compaction;
@@ -551,19 +595,26 @@ async function handleBeforeProviderRequest(
 		try {
 			contextWindows.synchronize(ctx);
 		} catch {
-			notifyLocalContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 			ctx.abort();
 			return undefined;
 		}
 	}
-	if (config.contextManagement !== "off" && await localContextActive(ctx, config)) {
+	if (config.contextManagement !== "off" && await contextActive(ctx, config)) {
 		try {
-			return contextWindows.rewritePayload(event.payload, ctx, "local");
+			const backend = selectedContextBackend(config, ctx.model);
+			if (backend === "off") return undefined;
+			return contextWindows.rewritePayload(event.payload, ctx, backend);
 		} catch {
-			notifyLocalContextFailure(ctx, "malformed-request-state");
+			notifyContextFailure(ctx, "malformed-request-state");
 			ctx.abort();
 			return undefined;
 		}
+	}
+	if (config.contextManagement !== "off" && isAllowlistedNativeCodexContextModel(ctx.model, config)) {
+		// Keep hosted no-summary windows mutually exclusive with legacy replay
+		// when authentication or tool ownership is unavailable.
+		return undefined;
 	}
 
 	const resolution = await resolveNativeCompactionEnvironment(
@@ -721,7 +772,12 @@ export default function registerCompactionExtension(
 ) {
 	const loadConfig = overrides.loadConfig ?? loadToolkitConfig;
 	const contextWindows = overrides.contextWindows ?? new CodexContextWindowManager(
-		(ctx) => loadLocalThreadHint(ctx),
+		(ctx, signal) => {
+			const config = loadConfig().config.compaction;
+			return selectedContextBackend(config, ctx.model) === "remote"
+				? loadHistoryNotesThreadHint(ctx, signal, config.gatewayContextModels)
+				: loadLocalThreadHint(ctx);
+		},
 		(event, status, ctx) => {
 			const config = loadConfig().config.compaction;
 			writeDebugArtifact(
@@ -731,7 +787,9 @@ export default function registerCompactionExtension(
 				ctx,
 			);
 		},
-		(ctx) => localContextIdentity(ctx).agentName,
+		(ctx) => selectedContextBackend(loadConfig().config.compaction, ctx.model) === "remote"
+			? "/root"
+			: localContextIdentity(ctx).agentName,
 	);
 	const dependencies: CompactionDependencies = {
 		loadConfig,
@@ -747,17 +805,15 @@ export default function registerCompactionExtension(
 		contextWindows,
 		async (ctx) => {
 			const config = dependencies.loadConfig().config.compaction;
-			return tools.isRegistered && await isLocalContextActive(ctx, config);
+			return tools.isRegistered && await isContextActive(ctx, config);
 		},
-		undefined,
-		() => "local",
+		() => dependencies.loadConfig().config.compaction.gatewayContextModels,
+		(ctx) => selectedContextBackend(dependencies.loadConfig().config.compaction, ctx.model) === "remote" ? "remote" : "local",
 	);
-	const localContextActive: LocalContextActive = async (ctx, config, model = ctx.model) =>
-		tools.isRegistered && await isLocalContextActive(ctx, config, model);
-	const selectedContextBackend = (config: CompactionConfig) =>
-		!config.enabled || config.contextManagement === "off" ? "off" as const : "local" as const;
-	const registerLocalSource = async (ctx: ExtensionContext, config: CompactionConfig): Promise<void> => {
-		if (!config.enabled || config.contextManagement === "off") return;
+	const contextActive: ContextActive = async (ctx, config, model = ctx.model) =>
+		tools.isRegistered && await isContextActive(ctx, config, model);
+	const registerLocalSource = async (ctx: ExtensionContext, config: CompactionConfig, model: ExtensionContext["model"]): Promise<void> => {
+		if (selectedContextBackend(config, model) !== "local") return;
 		try {
 			await registerLocalHistorySource(ctx);
 			localSourceRegistered = true;
@@ -767,13 +823,23 @@ export default function registerCompactionExtension(
 	};
 	const syncTools = async (ctx: ExtensionContext, model = ctx.model): Promise<boolean> => {
 		const config = dependencies.loadConfig().config.compaction;
-		await registerLocalSource(ctx, config);
-		const active = await isLocalContextActive(ctx, config, model);
+		const backend = selectedContextBackend(config, model);
+		const active = await isContextActive(ctx, config, model);
+		// Always reconcile the active set, including inactive/unallowlisted models.
 		const synced = tools.sync(active);
 		const effectiveActive = active && synced;
+		if (backend !== "local" && localSourceRegistered) {
+			try { await checkpointLocalHistory(ctx); }
+			catch { notifyWarning(ctx, "Local history checkpoint failed while leaving local context management."); }
+			finally {
+				unregisterLocalHistorySource(ctx);
+				localSourceRegistered = false;
+			}
+		}
+		if (effectiveActive) await registerLocalSource(ctx, config, model);
 		contextWindows.observeRuntime(
 			ctx,
-			selectedContextBackend(config),
+			backend,
 			effectiveActive,
 			config.contextReminderThresholdPercent,
 		);
@@ -786,13 +852,17 @@ export default function registerCompactionExtension(
 		if (!config.enabled) return;
 
 		let activationReason: string | undefined;
-		if (config.contextManagement !== "off") {
+		const backend = selectedContextBackend(config, ctx.model);
+		if (backend !== "off") {
 			if (active) {
 				try { contextWindows.ensureInitialized(pi, ctx, true); }
-				catch { notifyLocalContextFailure(ctx, "malformed-window-state"); }
+				catch { notifyContextFailure(ctx, "malformed-window-state"); }
 			} else if (!tools.isRegistered) {
 				activationReason = "tool-name-conflict";
-				notifyLocalContextFailure(ctx, activationReason);
+				notifyContextFailure(ctx, activationReason);
+			} else if (backend === "remote") {
+				activationReason = "codex-context-unavailable";
+				notifyContextFailure(ctx, activationReason);
 			}
 		}
 
@@ -828,8 +898,8 @@ export default function registerCompactionExtension(
 		}
 	});
 
-	pi.on("context", (event, ctx) => handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, localContextActive));
-	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, localContextActive));
+	pi.on("context", (event, ctx) => handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, contextActive));
+	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, contextActive));
 	pi.on("session_compact", (event, _ctx) => contextWindows.recordCompaction(event.compactionEntry.details));
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (localSourceRegistered) {
@@ -843,7 +913,7 @@ export default function registerCompactionExtension(
 		const config = dependencies.loadConfig().config.compaction;
 		contextWindows.observeRuntime(
 			ctx,
-			selectedContextBackend(config),
+			selectedContextBackend(config, ctx.model),
 			false,
 			config.contextReminderThresholdPercent,
 		);
@@ -858,21 +928,48 @@ export default function registerCompactionExtension(
 		try {
 			contextWindows.ensureInitialized(pi, ctx, true);
 		} catch {
-			notifyLocalContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 		}
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const active = await syncTools(ctx);
 		const config = dependencies.loadConfig().config.compaction;
-		if (active && selectedContextBackend(config) === "local") {
+		if (active && selectedContextBackend(config, ctx.model) === "local") {
 			const identity = localContextIdentity(ctx);
 			return { systemPrompt: `${_event.systemPrompt}\n\nLocal context identity: agent ${identity.agentName}. History and notes are scoped to this task/session, not the project. Relative notes paths use ${identity.agentName}/notes; absolute virtual paths can address another agent's notes in this task. History defaults to this agent; use agent_name for another agent.` };
 		}
 	});
-	pi.on("before_provider_request", (event, ctx) => handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, localContextActive));
+	pi.on("before_provider_request", (event, ctx) => handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, contextActive));
+	pi.on("before_provider_headers", async (event, ctx) => {
+		const config = dependencies.loadConfig().config.compaction;
+		if (selectedContextBackend(config, ctx.model) !== "remote") return;
+		if (!(await contextActive(ctx, config))) return;
+		const provider = await resolveCodexContextProvider(ctx, ctx.model, config.gatewayContextModels);
+		if (provider.ok && provider.provider.kind === "codex-gateway") {
+			const sessionId = getSessionId(ctx);
+			const gatewayHeaders = codexContextProviderHeaders(provider.provider, {
+				sessionId,
+				clientRequestId: sessionId,
+			});
+			for (const name of [
+				"authorization", "originator", "user-agent", "version", "session-id",
+				"x-client-request-id", "x-codex-affinity-scope", "x-codex-model",
+			]) {
+				for (const existing of Object.keys(event.headers)) {
+					if (existing.toLowerCase() === name) delete event.headers[existing];
+				}
+				const value = gatewayHeaders.get(name);
+				if (value) event.headers[name] = value;
+			}
+			for (const existing of Object.keys(event.headers)) {
+				if (["cookie", "chatgpt-account-id", "x-api-key"].includes(existing.toLowerCase())) delete event.headers[existing];
+			}
+		}
+		contextWindows.rewriteHeaders(event.headers, ctx);
+	});
 	pi.on("message_end", (event, ctx) => {
 		const config = dependencies.loadConfig().config.compaction;
-		if (config.contextManagement === "off" || !tools.isRegistered) return undefined;
+		if (selectedContextBackend(config, ctx.model) === "off" || !tools.isRegistered) return undefined;
 		const message = routeContextNamespaceToolMessage(event.message);
 		return message === event.message ? undefined : { message };
 	});

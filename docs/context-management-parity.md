@@ -1,6 +1,6 @@
 # Local context: task scope and agent namespaces
 
-With `contextManagement: "auto"`, every provider, including native `openai-codex`, uses this local history/notes and window-transport backend. It makes no Codex alpha history/notes request, OAuth resolution, hosted context-header rewrite, or encrypted tool-output rewrite. It mirrors the public **task/session and agent addressing contract** of Codex history/notes, but it does not reproduce OpenAI's encrypted model-only state. Existing remote context data is not migrated; opaque remote history/notes outputs are omitted from local request transport, while ordinary native-model reasoning remains intact.
+With `contextManagement: "auto"`, non-Codex providers use this local history/notes and window-transport backend. It makes no Codex alpha history/notes request, OAuth resolution, hosted context-header rewrite, or encrypted tool-output rewrite. Allowlisted native `openai-codex` models instead use hosted history/notes and no-summary rolling windows; unallowlisted native Codex models leave context management off and use independent Remote Compaction v2. This local backend mirrors the public **task/session and agent addressing contract** of Codex history/notes, but it does not reproduce OpenAI's encrypted model-only state. Existing remote context data is not migrated; opaque remote history/notes outputs are omitted from local request transport, while ordinary native-model reasoning remains intact.
 
 ## Identity contract
 
