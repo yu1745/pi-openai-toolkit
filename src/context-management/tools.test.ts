@@ -92,7 +92,31 @@ test("new_context force bypasses the checkpoint gate", async () => {
 	expect(result.details).toEqual({ started: true });
 });
 
-test("new_context is still gated when remote context is inactive", async () => {
+test("get_context_remaining preserves its response and adds status details", async () => {
+	const branch = [
+		{
+			type: "custom_message", id: "entry-b", parentId: null, timestamp: "2026-09-07T00:00:00.000Z",
+			customType: CODEX_CONTEXT_WINDOW_MESSAGE_TYPE, content: "window", display: true,
+			details: boundaryDetails("w-current"),
+		},
+	] as never[];
+	const manager = new CodexContextWindowManager(async () => undefined);
+	manager.restore(branch, "session-1");
+	const tools = createContextManagementTools(activePi, manager, () => true);
+	const result = await tools.getContextRemaining.execute("t1", {}, undefined, undefined, makeCtx(branch));
+	expect(result.content[0]).toEqual({ type: "text", text: "You have unknown tokens left in this context window." });
+	expect(result.details).toMatchObject({
+		windowId: "w-current",
+		contextWindow: 83_616,
+		status: {
+			projectIdentity: { kind: "canonical-cwd" },
+			budget: { thresholdPercent: 5 },
+		},
+	});
+	expect(result.details.status.projectIdentity.key).toMatch(/^[a-f0-9]{64}$/);
+});
+
+test("new_context is still gated when local context is inactive", async () => {
 	const branch = [
 		{
 			type: "custom_message", id: "entry-b", parentId: null, timestamp: "2026-09-07T00:00:00.000Z",
@@ -105,5 +129,5 @@ test("new_context is still gated when remote context is inactive", async () => {
 	const tools = createContextManagementTools(activePi, manager, () => false);
 	await expect(
 		tools.newContext.execute("t1", { force: true }, undefined, undefined, makeCtx(branch)),
-	).rejects.toThrow("remote-context-inactive");
+	).rejects.toThrow("local-context-inactive");
 });

@@ -40,10 +40,11 @@ Checkpoint the active request, known history IDs, decisions, progress, learnings
 export function renderContextWindowMessage(
 	identity: ContextWindowIdentity,
 	threadHint?: string,
+	agentName = "/root",
 ): string {
 	const lines = [
 		"<context_window>",
-		"Agent name: /root",
+		`Agent name: ${agentName}`,
 		`First context window id: ${identity.firstWindowId}`,
 		`Current context window id: ${identity.currentWindowId}`,
 	];

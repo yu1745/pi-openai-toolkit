@@ -16,7 +16,7 @@ try {
 	assert.equal(manifest.version, "0.85.1");
 	const configDir = join(env.agentDir, "extensions/pi-openai-toolkit");
 	await mkdir(configDir, { recursive: true });
-	await writeFile(join(configDir, "config.json"), JSON.stringify({ compaction: { nativeFallback: { enabled: false } } }));
+	await writeFile(join(configDir, "config.json"), JSON.stringify({ compaction: { contextManagement: "off", nativeFallback: { enabled: false } } }));
 	const modelRuntime = await ModelRuntime.create({
 		credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null,
 		refreshOnCreate: false, allowModelNetwork: false,

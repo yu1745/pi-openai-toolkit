@@ -14,11 +14,12 @@ export const REDACTED_VALUE = "[REDACTED]";
  */
 export const RESPONSES_COMPACT_CAPABLE_APIS = ["openai-responses", "openai-codex-responses"] as const;
 /**
- * The Codex model whose gateways are verified to speak the alpha window and
- * Astra compatibility protocols. Remote Context and the Astra layer match on
- * this bare model id; no operator allowlist is consulted.
+ * The Codex model whose Astra compatibility layer matches this bare model id.
+ * Hosted no-summary Context Management is separately gated by the configured
+ * native Codex provider/model allowlist.
  */
 export const ASTRA_MODEL_ID = "gpt-6-astra";
+
 export const LEGACY_NATIVE_COMPACTION_STRATEGY = "openai-native-compact-v1";
 export const REMOTE_V2_COMPACTION_STRATEGY = "openai-remote-compaction-v2";
 export const NATIVE_COMPACTION_STRATEGY = REMOTE_V2_COMPACTION_STRATEGY;
@@ -44,7 +45,7 @@ export type DebugArtifactKind =
 	| "compaction-event"
 	| "lifecycle";
 
-export type ContextManagementMode = "off" | "remote";
+export type ContextManagementMode = "off" | "auto";
 
 /** Native-method fallback compaction: which model runs pi's compact() and how deeply. */
 export type NativeFallbackConfig = {
@@ -62,7 +63,7 @@ export type NativeFallbackConfig = {
 
 export type CompactionConfig = {
 	enabled: boolean;
-	/** Optional Codex Remote Context management. Disabled by default for compatibility. */
+	/** Context windows use the hosted backend for allowlisted native Codex models and local storage for other providers. */
 	contextManagement: ContextManagementMode;
 	/**
 	 * Allow a Responses session whose latest compaction was not created by this extension
@@ -81,9 +82,9 @@ export type CompactionConfig = {
 	 */
 	responsesApis: string[];
 	/**
-	 * Exact "provider/model" keys allowed to use Codex Remote Context on the
-	 * `openai-responses` gateway wire. The native `openai-codex` route ignores
-	 * this list; gateway coverage is opt-in per model.
+	 * Exact native Codex provider/model keys allowed to use hosted no-summary
+	 * context windows. This allowlist is synchronized from
+	 * settings.json openaiToolkit.codexContextModels when present.
 	 */
 	gatewayContextModels: string[];
 	/**
@@ -518,7 +519,7 @@ export const DEFAULT_CODEX_CONTEXT_MODELS = [
 
 export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 	enabled: true,
-	contextManagement: "remote",
+	contextManagement: "off",
 	allowCompactionContinuityBreak: false,
 	remoteCompactModel: undefined,
 	nativeFallback: { ...DEFAULT_NATIVE_FALLBACK_CONFIG },

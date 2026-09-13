@@ -1,6 +1,6 @@
 # pi-openai-toolkit
 
-Add Codex context windows, Responses compaction, hosted tools, and reviewed tool calls to Pi.
+Add local context windows, Responses compaction, hosted tools, and reviewed tool calls to Pi.
 
 [![npm version](https://img.shields.io/npm/v/pi-openai-toolkit.svg)](https://www.npmjs.com/package/pi-openai-toolkit)
 [![License: MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
@@ -11,7 +11,7 @@ Add Codex context windows, Responses compaction, hosted tools, and reviewed tool
 
 | Feature | Use it to |
 | --- | --- |
-| Codex Remote Context | Start a new context window and retrieve earlier windows with `history`. |
+| Local Context Management | Start a new context window and retrieve earlier windows with local `history` and `notes`. |
 | Remote Compaction v2 | Continue an eligible Responses session with an encrypted server checkpoint. |
 | Hosted Web Search | Give selected models OpenAI's hosted search tool. |
 | Image generation | Generate images or edit explicitly supplied local reference images. |
@@ -31,7 +31,7 @@ pi install npm:pi-openai-toolkit
 
 Use `--local` to install it in the current project.
 
-Installing the package alone does not enable every feature. With no extension config, compaction is enabled but Remote Context is off, the Web Search model list is empty, image generation is disabled, and Auto Mode has no allowed models or reviewer.
+Installing the package alone does not enable every feature. With no extension config, compaction is enabled but local Context Management is off, the Web Search model list is empty, image generation is disabled, and Auto Mode has no allowed models or reviewer.
 
 The extension config file is:
 
@@ -39,37 +39,37 @@ The extension config file is:
 
 All JSON configuration examples below, except the `models.json` example, go in this file. If it does not exist, create the file and its parent directory. If it already exists, merge fields into the matching objects and keep the other settings.
 
-## Quick start: enable Remote Context
+## Quick start: enable Context Management
 
 This section is for users who want Codex-style context windows. If you only want Web Search, image generation, or tool-call review, skip to [Common tasks](#common-tasks).
 
-### Use Pi's built-in Codex provider
+### Use any configured Pi model
 
-You must already be signed in to Pi's built-in `openai-codex` provider.
+Context Management uses hybrid routing. Allowlisted native `openai-codex` models use hosted history/notes and no-summary rolling windows; other providers use the local backend. Native Codex models outside the rolling-window allowlist keep Context Management off and use the independent Remote Compaction v2 path. Normal model inference always uses the provider authentication configured in Pi.
 
 Create or merge this extension config:
 
 ```json
 {
   "compaction": {
-    "contextManagement": "remote"
+    "contextManagement": "auto"
   }
 }
 ```
 
-Start Pi with a model from your existing Codex catalog:
+Start Pi with any model already configured in Pi, for example:
 
 ```bash
 pi --model openai-codex/<model-id>
 ```
 
-Replace `<model-id>` with the model ID shown by your Pi setup. The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools.
+The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools. With `contextManagement: "auto"`, non-Codex providers use the local backend: no Codex alpha history/notes request, hosted context header, or encrypted tool-output rewrite is used. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local context parity](docs/context-management-parity.md).
 
-### Use a compatible gateway
+The hosted rolling-window allowlist is read without modification from `~/.pi/agent/settings.json` at `openaiToolkit.codexContextModels`. Its defaults are `openai-codex/gpt-6-astra` and `openai-codex/gpt-5.6-sol`. Only allowlisted native Codex models receive the hosted transport; an unlisted native Codex model deliberately receives no context-management tools or window ownership.
 
-This route requires the `openai-responses` API and a gateway that preserves the Codex protocol fields used by Remote Context. A successful ordinary chat request does not prove Remote Context compatibility.
+### Use another provider or gateway
 
-If `~/.pi/agent/models.json` already contains a gateway model that meets these conditions, skip model configuration and set the extension allowlist directly. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
+If `~/.pi/agent/models.json` already contains the model, skip model configuration. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
 
 ```json
 {
@@ -103,13 +103,12 @@ In a POSIX shell:
 export MY_GATEWAY_KEY="replace-with-your-gateway-key"
 ```
 
-Use the same terminal session to start Pi. Create or merge the extension config, and make the allowlist entry exactly match the provider and model ID:
+Use the same terminal session to start Pi. Create or merge the extension config:
 
 ```json
 {
   "compaction": {
-    "contextManagement": "remote",
-    "gatewayContextModels": ["my-gateway/gpt-5.6-luna"]
+    "contextManagement": "auto"
   }
 }
 ```
@@ -120,7 +119,7 @@ Start Pi with the same model specification:
 pi --model my-gateway/gpt-5.6-luna
 ```
 
-The enablement check is the same: the session should expose `new_context`, `get_context_remaining`, `history`, and `notes`. If they do not appear, read the toolkit notification and check the exact provider/model string, API, key, base URL, and allowlist entry.
+The enablement check is the same: the session should expose `new_context`, `get_context_remaining`, `history`, and `notes`. If they do not appear, read the toolkit notification and check the extension configuration and tool-name conflicts.
 
 Earlier windows remain available through `history`, but they are not all automatically added to the current context.
 
@@ -128,7 +127,7 @@ Earlier windows remain available through `history`, but they are not all automat
 
 ### Continue a session with server-side compaction
 
-Leave Remote Context off when you want the Responses compaction path instead. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
+Set Context Management to `"off"` when you want the Responses compaction path instead. Unallowlisted native Codex models also use this independent Remote Compaction v2 path while `contextManagement` is `"auto"`; they do not receive no-summary rolling windows. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
 
 ### Enable hosted Web Search
 
@@ -183,8 +182,8 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | Key | Default | Use |
 | --- | --- | --- |
 | `compaction.enabled` | `true` | Master switch for compaction. |
-| `compaction.contextManagement` | `"off"` | Enables Codex Remote Context when set to `"remote"`. |
-| `compaction.gatewayContextModels` | `[]` | Gateway models allowed to use Remote Context. |
+| `compaction.contextManagement` | `"off"` | `"auto"` routes allowlisted native `openai-codex` models to hosted rolling windows, non-Codex providers to local history/notes and windows, and unallowlisted native Codex models to independent Remote Compaction v2. Unknown values fail closed. |
+| `compaction.gatewayContextModels` | `openai-codex/gpt-6-astra`, `openai-codex/gpt-5.6-sol` | Hosted native-Codex rolling-window allowlist; synchronized from `settings.json` `openaiToolkit.codexContextModels` when present. |
 | `compaction.remoteCompactModel` | unset | Optional model used only for a v2 compaction request. |
 | `compaction.contextReminderThresholdPercent` | `5` | Remaining budget percentage for the once-per-window reminder. `0` disables the reminder and exhausted-window fallback. |
 | `webSearch.models` | `[]` | Models that receive hosted Web Search. |
@@ -194,6 +193,21 @@ The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unkno
 | `autoMode.reviewerModel` | unset | Model that reviews Auto Mode calls. |
 | `autoMode.gate` | `"side-effect"` | Use `"all"` to review every tool call. |
 | `autoMode.timeoutMs` | `30000` | Review timeout in milliseconds. |
+
+## Local storage and context diagnostics
+
+Local Context storage lives below `~/.pi/agent/extensions/pi-openai-toolkit/context-management/`:
+
+- `sessions/<root-session-key>/agents/root/notes/` contains root-agent notes; children use `agents/root/<agent-id>/notes/`. `<root-session-key>` is the SHA-256 of the root Pi session ID, independent of project paths.
+- Relative `state.md` addresses the current agent. Absolute virtual `/root/<agent-id>/notes/state.md` can read or write another agent within the same root session. Omitted list/search prefixes select only the current agent's notes.
+- `sessions/<root-session-key>/sources/` registers exact session sources; `history.sqlite` indexes them. Persisted Pi JSONL is the rebuildable source of truth; no project-wide or global session scan occurs. Live SDK in-memory sessions are readable and receive a best-effort final index snapshot on shutdown, but their history is not guaranteed to survive index rebuilding.
+- Every history action, including `read_item`, defaults to the current agent. `agent_name` can be absolute or relative to the caller. `search_contents` is case-sensitive literal substring matching.
+- Legacy `notes/<project-key>/` and `history/<project-key>.sqlite` are **left untouched: not read, migrated, or deleted automatically**. Copy old notes only after choosing and verifying the destination task. Ordinary `/new` and `/fork` create separate scopes; resuming the same session preserves its scope.
+- `status/<project-key>/<session-key>/latest.json` is the best-effort, atomically replaced status for one session. It is bounded to 16 KiB, its file mode is `0600` (directory `0700`), and it does not grow once per turn.
+
+Diagnostic project identity still hashes the Git common directory (canonical cwd on probe failure), but no longer defines Notes/History scope. The status reports the selected backend and activation, hashed project identity kind/key, window id/number and initialization/restoration, remaining budget and configured reminder threshold, reminder/fallback state, successful Notes checkpoint size when available, rollover outcome, and restoration state. `get_context_remaining` keeps its existing first sentence and token fields and also returns this status in `details.status`.
+
+Status collection is local-only and never includes Notes text, prompts, credentials, encrypted output, or cwd/session file paths. Writes are best-effort: an observer failure cannot block a request or context rollover. With `compaction.debug: true`, the same content-free status transitions are also written as detailed lifecycle artifacts; these lifecycle events do not include Notes or prompt bodies. Payload artifacts remain governed separately by the explicit payload logging options.
 
 ## Development
 

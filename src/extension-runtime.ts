@@ -9,15 +9,19 @@ import type {
 import { loadToolkitConfig } from "./config";
 import {
 	codexContextProviderHeaders,
-	resolveCodexContextProvider,
-	isCodexGatewayModel,
 	isNativeCodexModel,
+	resolveCodexContextProvider,
 } from "./context-management/codex-provider";
-import { routeContextNamespaceToolMessage } from "./context-management/namespace-tools";
 import { loadHistoryNotesThreadHint } from "./context-management/history-notes";
+import { routeContextNamespaceToolMessage } from "./context-management/namespace-tools";
+import { loadLocalThreadHint } from "./context-management/local-backend";
+import { registerLocalHistorySource, unregisterLocalHistorySource } from "./context-management/history-source";
+import { checkpointLocalHistory } from "./context-management/history-service";
+import { localContextIdentity } from "./context-management/local-identity";
 import { CodexContextWindowManager } from "./context-management/window-manager";
 import { registerContextManagementTools } from "./context-management/tools";
 import { writeDebugArtifact, writeReplayFailureArtifact } from "./debug";
+import { isExactModelAllowed } from "./model-scope";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
 import { runNativeFallbackCompaction } from "./native-fallback";
 import {
@@ -51,7 +55,7 @@ type CompactionDependencies = {
 	contextWindows: CodexContextWindowManager;
 };
 
-type RemoteContextActive = (
+type ContextActive = (
 	ctx: ExtensionContext,
 	config: CompactionConfig,
 	model?: ExtensionContext["model"],
@@ -104,27 +108,38 @@ function notifyWarning(ctx: ExtensionContext, message: string): void {
 	}
 }
 
-async function isRemoteContextActive(
+function isAllowlistedNativeCodexContextModel(
+	model: ExtensionContext["model"] | undefined,
+	config: CompactionConfig,
+): boolean {
+	return isNativeCodexModel(model) && isExactModelAllowed(model, config.gatewayContextModels);
+}
+
+function selectedContextBackend(
+	config: CompactionConfig,
+	model: ExtensionContext["model"] | undefined,
+): "off" | "remote" | "local" {
+	if (!config.enabled || config.contextManagement === "off" || !model) return "off";
+	if (isNativeCodexModel(model)) {
+		return isAllowlistedNativeCodexContextModel(model, config) ? "remote" : "off";
+	}
+	return "local";
+}
+
+async function isContextActive(
 	ctx: ExtensionContext,
 	config: CompactionConfig,
 	model: ExtensionContext["model"] = ctx.model,
 ): Promise<boolean> {
-	if (!config.enabled || config.contextManagement !== "remote") return false;
-	const resolution = await resolveCodexContextProvider(ctx, model, config.gatewayContextModels);
-	return resolution.ok;
+	const backend = selectedContextBackend(config, model);
+	if (backend === "off") return false;
+	if (backend === "local") return true;
+	return (await resolveCodexContextProvider(ctx, model, config.gatewayContextModels)).ok;
 }
 
-function isCodexContextModel(
-	model: ExtensionContext["model"] | undefined,
-	config: CompactionConfig,
-): boolean {
-	return config.contextManagement === "remote"
-		&& (isNativeCodexModel(model, config.gatewayContextModels) || isCodexGatewayModel(model, config.gatewayContextModels));
-}
-
-function notifyRemoteContextFailure(ctx: ExtensionContext, reason: string): void {
+function notifyContextFailure(ctx: ExtensionContext, reason: string): void {
 	if (ctx.hasUI) {
-		ctx.ui.notify(`${COMPACTION_EXTENSION_ID}: Remote Context management inactive (${reason})`, "warning");
+		ctx.ui.notify(`${COMPACTION_EXTENSION_ID}: Context management inactive (${reason})`, "warning");
 	}
 }
 
@@ -340,7 +355,7 @@ async function handleSessionBeforeCompact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 	dependencies: CompactionDependencies,
-	remoteContextActive: RemoteContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: toolkitConfig } = dependencies.loadConfig();
 	const config = toolkitConfig.compaction;
@@ -369,25 +384,22 @@ async function handleSessionBeforeCompact(
 		return { cancel: true };
 	}
 
-	// Remote Context management owns this eligible Codex session. It persists a
-	// no-summary boundary and deliberately never calls remote_compaction_v2.
-	if (isCodexContextModel(ctx.model, config)) {
-		if (await remoteContextActive(ctx, config)) {
-			try {
-				dependencies.contextWindows.synchronize(ctx);
-				return dependencies.contextWindows.prepareCompaction(event);
-			} catch {
-				notifyRemoteContextFailure(ctx, "malformed-window-state");
-				return { cancel: true };
-			}
+	// Context windows own only a scheduled rollover. Other compactions retain
+	// the existing remote-v2/native-fallback behavior.
+	if (config.contextManagement !== "off" && await contextActive(ctx, config)) {
+		try {
+			dependencies.contextWindows.synchronize(ctx);
+			return dependencies.contextWindows.prepareCompaction(event);
+		} catch {
+			notifyContextFailure(ctx, "malformed-window-state");
+			return { cancel: true };
 		}
-		// A configured native Codex Remote session must never re-enter this
-		// extension's Remote V2 compaction chain, and Pi's native compaction is
-		// deliberately disabled for Remote-managed models: cancelling here keeps
-		// the boundary the only rollover mechanism. The inactive reason is
-		// surfaced so the user can fix activation instead of losing context to a
-		// silent native summary.
-		notifyRemoteContextFailure(ctx, "native-codex-context-unavailable");
+	}
+
+	// An allowlisted native Codex session owns its no-summary window lifecycle.
+	// If hosted authentication or tool ownership is unavailable, never replay it
+	// through the incompatible remote_compaction_v2 transport.
+	if (config.contextManagement !== "off" && isAllowlistedNativeCodexContextModel(ctx.model, config)) {
 		return { cancel: true };
 	}
 
@@ -496,7 +508,7 @@ async function handleContext(
 	pi: ExtensionAPI,
 	loadConfig: typeof loadToolkitConfig,
 	contextWindows: CodexContextWindowManager,
-	remoteContextActive: RemoteContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: { compaction: config } } = loadConfig();
 	if (!config.enabled) {
@@ -506,39 +518,37 @@ async function handleContext(
 			: { messages: visibleMessages };
 	}
 
-	if (config.contextManagement === "remote") {
+	if (config.contextManagement !== "off") {
 		try {
 			contextWindows.synchronize(ctx);
 		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 			ctx.abort();
 			return undefined;
 		}
 
-		const remoteActive = await remoteContextActive(ctx, config);
-		if (remoteActive) {
+		if (await contextActive(ctx, config)) {
 			try {
+				const backend = selectedContextBackend(config, ctx.model);
 				contextWindows.recordBudget(
 					pi,
 					ctx,
 					true,
 					config.contextReminderThresholdPercent,
 				);
-				const projected = contextWindows.project(event.messages, "remote");
+				const projected = contextWindows.project(event.messages, backend);
 				return projected.length === event.messages.length && projected.every((message, index) => message === event.messages[index])
 					? undefined
 					: { messages: projected };
-			} catch (error) {
-				notifyRemoteContextFailure(ctx, "malformed-window-state");
+			} catch {
+				notifyContextFailure(ctx, "malformed-window-state");
 				ctx.abort();
 				return undefined;
 			}
 		}
 
-		// An eligible Codex Remote session is never allowed to fall through to the
-		// older compaction-replay path. Keep its internal markers hidden, but let
-		// Pi's normal request construction handle the inactive session.
-		if (isCodexContextModel(ctx.model, config)) {
+		// A failed allowlisted hosted session must not enter compaction replay.
+		if (isAllowlistedNativeCodexContextModel(ctx.model, config)) {
 			const visibleMessages = contextWindows.project(event.messages, "off");
 			return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
 				? undefined
@@ -546,9 +556,8 @@ async function handleContext(
 		}
 	}
 
-	// Inactive/ineligible Remote mode must not expose internal window markers to a
-	// gateway or another provider. The existing compaction replay path remains the
-	// owner for this safe fallback.
+	// Inactive context management must not expose internal window markers to the
+	// legacy compaction-replay path.
 	const visibleMessages = contextWindows.project(event.messages, "off");
 	const replayEvent = visibleMessages === event.messages ? event : { ...event, messages: visibleMessages };
 	const resolution = await resolveNativeCompactionEnvironment(ctx, {
@@ -574,7 +583,7 @@ async function handleBeforeProviderRequest(
 	ctx: ExtensionContext,
 	loadConfig: typeof loadToolkitConfig,
 	contextWindows: CodexContextWindowManager,
-	remoteContextActive: RemoteContextActive,
+	contextActive: ContextActive,
 ) {
 	const { config: toolkitConfig } = loadConfig();
 	const config = toolkitConfig.compaction;
@@ -582,27 +591,29 @@ async function handleBeforeProviderRequest(
 		return undefined;
 	}
 
-	if (config.contextManagement === "remote") {
+	if (config.contextManagement !== "off") {
 		try {
 			contextWindows.synchronize(ctx);
 		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 			ctx.abort();
 			return undefined;
 		}
 	}
-	if (config.contextManagement === "remote" && await remoteContextActive(ctx, config)) {
+	if (config.contextManagement !== "off" && await contextActive(ctx, config)) {
 		try {
-			return contextWindows.rewritePayload(event.payload, ctx);
+			const backend = selectedContextBackend(config, ctx.model);
+			if (backend === "off") return undefined;
+			return contextWindows.rewritePayload(event.payload, ctx, backend);
 		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-request-state");
+			notifyContextFailure(ctx, "malformed-request-state");
 			ctx.abort();
 			return undefined;
 		}
 	}
-	if (isCodexContextModel(ctx.model, config)) {
-		// Keep Codex Remote mutually exclusive with the legacy replay
-		// pipeline when authentication or tool ownership is unavailable.
+	if (config.contextManagement !== "off" && isAllowlistedNativeCodexContextModel(ctx.model, config)) {
+		// Keep hosted no-summary windows mutually exclusive with legacy replay
+		// when authentication or tool ownership is unavailable.
 		return undefined;
 	}
 
@@ -760,8 +771,25 @@ export default function registerCompactionExtension(
 	overrides: Partial<CompactionDependencies> = {},
 ) {
 	const loadConfig = overrides.loadConfig ?? loadToolkitConfig;
-	const contextWindows = overrides.contextWindows ?? new CodexContextWindowManager((ctx, signal) =>
-		loadHistoryNotesThreadHint(ctx, signal, loadConfig().config.compaction.gatewayContextModels)
+	const contextWindows = overrides.contextWindows ?? new CodexContextWindowManager(
+		(ctx, signal) => {
+			const config = loadConfig().config.compaction;
+			return selectedContextBackend(config, ctx.model) === "remote"
+				? loadHistoryNotesThreadHint(ctx, signal, config.gatewayContextModels)
+				: loadLocalThreadHint(ctx);
+		},
+		(event, status, ctx) => {
+			const config = loadConfig().config.compaction;
+			writeDebugArtifact(
+				"lifecycle",
+				{ event: `context-management.${event}`, status },
+				config,
+				ctx,
+			);
+		},
+		(ctx) => selectedContextBackend(loadConfig().config.compaction, ctx.model) === "remote"
+			? "/root"
+			: localContextIdentity(ctx).agentName,
 	);
 	const dependencies: CompactionDependencies = {
 		loadConfig,
@@ -770,26 +798,52 @@ export default function registerCompactionExtension(
 		contextWindows,
 		...overrides,
 	};
+	let localSourceRegistered = false;
 	let tools!: ReturnType<typeof registerContextManagementTools>;
 	tools = registerContextManagementTools(
 		pi,
 		contextWindows,
 		async (ctx) => {
 			const config = dependencies.loadConfig().config.compaction;
-			return tools.isRegistered && await isRemoteContextActive(ctx, config);
+			return tools.isRegistered && await isContextActive(ctx, config);
 		},
 		() => dependencies.loadConfig().config.compaction.gatewayContextModels,
+		(ctx) => selectedContextBackend(dependencies.loadConfig().config.compaction, ctx.model) === "remote" ? "remote" : "local",
 	);
-	const remoteContextActive: RemoteContextActive = async (ctx, config, model = ctx.model) =>
-		tools.isRegistered && await isRemoteContextActive(ctx, config, model);
+	const contextActive: ContextActive = async (ctx, config, model = ctx.model) =>
+		tools.isRegistered && await isContextActive(ctx, config, model);
+	const registerLocalSource = async (ctx: ExtensionContext, config: CompactionConfig, model: ExtensionContext["model"]): Promise<void> => {
+		if (selectedContextBackend(config, model) !== "local") return;
+		try {
+			await registerLocalHistorySource(ctx);
+			localSourceRegistered = true;
+		} catch {
+			notifyWarning(ctx, "Local history source registration failed; history calls will retry.");
+		}
+	};
 	const syncTools = async (ctx: ExtensionContext, model = ctx.model): Promise<boolean> => {
 		const config = dependencies.loadConfig().config.compaction;
-		const active = await isRemoteContextActive(ctx, config, model);
-		// sync() reports whether the tool-set update succeeded; an inactive model
-		// syncs fine and returns true. The activation decision must use `active`
-		// itself, or non-covered models would receive a window boundary.
+		const backend = selectedContextBackend(config, model);
+		const active = await isContextActive(ctx, config, model);
+		// Always reconcile the active set, including inactive/unallowlisted models.
 		const synced = tools.sync(active);
-		return active && synced;
+		const effectiveActive = active && synced;
+		if (backend !== "local" && localSourceRegistered) {
+			try { await checkpointLocalHistory(ctx); }
+			catch { notifyWarning(ctx, "Local history checkpoint failed while leaving local context management."); }
+			finally {
+				unregisterLocalHistorySource(ctx);
+				localSourceRegistered = false;
+			}
+		}
+		if (effectiveActive) await registerLocalSource(ctx, config, model);
+		contextWindows.observeRuntime(
+			ctx,
+			backend,
+			effectiveActive,
+			config.contextReminderThresholdPercent,
+		);
+		return effectiveActive;
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		const active = await syncTools(ctx);
@@ -798,22 +852,17 @@ export default function registerCompactionExtension(
 		if (!config.enabled) return;
 
 		let activationReason: string | undefined;
-		// Only models the built-in Remote Context coverage targets may activate or
-		// warn; everything else silently runs Pi's normal compaction path.
-		if (config.contextManagement === "remote" && isCodexContextModel(ctx.model, config)) {
+		const backend = selectedContextBackend(config, ctx.model);
+		if (backend !== "off") {
 			if (active) {
-				try {
-					contextWindows.ensureInitialized(pi, ctx, true);
-				} catch {
-					notifyRemoteContextFailure(ctx, "malformed-window-state");
-				}
+				try { contextWindows.ensureInitialized(pi, ctx, true); }
+				catch { notifyContextFailure(ctx, "malformed-window-state"); }
 			} else if (!tools.isRegistered) {
 				activationReason = "tool-name-conflict";
-				notifyRemoteContextFailure(ctx, activationReason);
-			} else {
-				const remoteResolution = await resolveCodexContextProvider(ctx, ctx.model, config.gatewayContextModels);
-				activationReason = remoteResolution.ok ? "codex-context-unavailable" : remoteResolution.reason;
-				notifyRemoteContextFailure(ctx, activationReason);
+				notifyContextFailure(ctx, activationReason);
+			} else if (backend === "remote") {
+				activationReason = "codex-context-unavailable";
+				notifyContextFailure(ctx, activationReason);
 			}
 		}
 
@@ -849,35 +898,52 @@ export default function registerCompactionExtension(
 		}
 	});
 
-	pi.on("context", (event, ctx) => handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, remoteContextActive));
-	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, remoteContextActive));
+	pi.on("context", (event, ctx) => handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, contextActive));
+	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, contextActive));
 	pi.on("session_compact", (event, _ctx) => contextWindows.recordCompaction(event.compactionEntry.details));
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (localSourceRegistered) {
+			try { await checkpointLocalHistory(ctx); }
+			catch { notifyWarning(ctx, "Local history checkpoint failed during shutdown."); }
+			finally {
+				unregisterLocalHistorySource(ctx);
+				localSourceRegistered = false;
+			}
+		}
+		const config = dependencies.loadConfig().config.compaction;
+		contextWindows.observeRuntime(
+			ctx,
+			selectedContextBackend(config, ctx.model),
+			false,
+			config.contextReminderThresholdPercent,
+		);
 		contextWindows.reset();
 		tools.reset();
 	});
 	pi.on("model_select", async (event, ctx) => {
 		const active = await syncTools(ctx, event.model);
-		// Switching into a covered model mid-session must open the window
-		// lifecycle immediately: without an identity the request rewrite skips
-		// window metadata, the backend never ingests those turns, and the first
-		// new_context would trim pre-switch history that no history can recover.
-		// ensureInitialized is idempotent when a window already exists.
+		// Context windows are model-independent; initialization is idempotent and
+		// keeps local history available across ordinary model switches.
 		if (!active) return;
 		try {
 			contextWindows.ensureInitialized(pi, ctx, true);
 		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
+			notifyContextFailure(ctx, "malformed-window-state");
 		}
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
-		await syncTools(ctx);
+		const active = await syncTools(ctx);
+		const config = dependencies.loadConfig().config.compaction;
+		if (active && selectedContextBackend(config, ctx.model) === "local") {
+			const identity = localContextIdentity(ctx);
+			return { systemPrompt: `${_event.systemPrompt}\n\nLocal context identity: agent ${identity.agentName}. History and notes are scoped to this task/session, not the project. Relative notes paths use ${identity.agentName}/notes; absolute virtual paths can address another agent's notes in this task. History defaults to this agent; use agent_name for another agent.` };
+		}
 	});
-	pi.on("before_provider_request", (event, ctx) => handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, remoteContextActive));
+	pi.on("before_provider_request", (event, ctx) => handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, contextActive));
 	pi.on("before_provider_headers", async (event, ctx) => {
 		const config = dependencies.loadConfig().config.compaction;
-		if (!isCodexContextModel(ctx.model, config)) return;
-		if (!(await remoteContextActive(ctx, config))) return;
+		if (selectedContextBackend(config, ctx.model) !== "remote") return;
+		if (!(await contextActive(ctx, config))) return;
 		const provider = await resolveCodexContextProvider(ctx, ctx.model, config.gatewayContextModels);
 		if (provider.ok && provider.provider.kind === "codex-gateway") {
 			const sessionId = getSessionId(ctx);
@@ -886,14 +952,8 @@ export default function registerCompactionExtension(
 				clientRequestId: sessionId,
 			});
 			for (const name of [
-				"authorization",
-				"originator",
-				"user-agent",
-				"version",
-				"session-id",
-				"x-client-request-id",
-				"x-codex-affinity-scope",
-				"x-codex-model",
+				"authorization", "originator", "user-agent", "version", "session-id",
+				"x-client-request-id", "x-codex-affinity-scope", "x-codex-model",
 			]) {
 				for (const existing of Object.keys(event.headers)) {
 					if (existing.toLowerCase() === name) delete event.headers[existing];
@@ -909,7 +969,7 @@ export default function registerCompactionExtension(
 	});
 	pi.on("message_end", (event, ctx) => {
 		const config = dependencies.loadConfig().config.compaction;
-		if (!isCodexContextModel(ctx.model, config) || !tools.isRegistered) return undefined;
+		if (selectedContextBackend(config, ctx.model) === "off" || !tools.isRegistered) return undefined;
 		const message = routeContextNamespaceToolMessage(event.message);
 		return message === event.message ? undefined : { message };
 	});

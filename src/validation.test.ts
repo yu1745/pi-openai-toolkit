@@ -434,10 +434,10 @@ afterEach(() => {
 	fs.rmSync(testArtifactRoot, { recursive: true, force: true });
 });
 
-test("gateway Remote Context headers preserve session affinity and strip inherited credentials", async () => {
+test("local context management does not inject Codex headers into gateways", async () => {
 	const { sessionStart, beforeProviderHeaders } = await loadHookHarness({
 		config: {
-			contextManagement: "remote",
+			contextManagement: "auto",
 			gatewayContextModels: ["uwoacrimson/gpt-6-astra"],
 		},
 	});
@@ -461,14 +461,10 @@ test("gateway Remote Context headers preserve session affinity and strip inherit
 	};
 	await beforeProviderHeaders({ type: "before_provider_headers", headers }, ctx);
 
-	expect(headers.authorization).toBe("Bearer sk-test-gpt-6-astra");
-	expect(headers["session-id"]).toBe("session-validation");
-	expect(headers["x-client-request-id"]).toBe("session-validation");
-	expect(headers["x-codex-affinity-scope"]).toBe("codex-session-v1");
-	expect(headers["x-codex-model"]).toBe("gpt-6-astra");
-	expect(headers.cookie).toBeUndefined();
-	expect(headers["chatgpt-account-id"]).toBeUndefined();
-	expect(headers["x-api-key"]).toBeUndefined();
+	expect(headers).toEqual({
+		authorization: "Bearer stale", cookie: "stale", "chatgpt-account-id": "stale",
+		"x-api-key": "stale", "session-id": "stale", "x-client-request-id": "stale",
+	});
 });
 
 test("manual /compact preserves tool/result ordering + assistant phases and persists the native window", async () => {

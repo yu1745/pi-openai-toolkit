@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { CONFIG_PATH, loadToolkitConfig } from "./config";
 import {
 	DEFAULT_AUTO_MODE_CONFIG,
+	DEFAULT_CODEX_CONTEXT_MODELS,
 	DEFAULT_COMPACTION_CONFIG,
 	DEFAULT_IMAGE_GENERATION_CONFIG,
 	DEFAULT_NATIVE_FALLBACK_CONFIG,
@@ -37,7 +38,7 @@ describe("loadToolkitConfig", () => {
 
 	test("missing file yields independent defaults without warnings", () => {
 		const missingPath = path.join(os.tmpdir(), "pi-openai-toolkit-missing", "config.json");
-		const loaded = loadToolkitConfig(missingPath);
+		const loaded = loadToolkitConfig(missingPath, `${missingPath}.settings.json`);
 
 		expect(loaded.source).toBeUndefined();
 		expect(loaded.warnings).toEqual([]);
@@ -50,7 +51,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.compaction.responsesApis).toEqual([
 			...DEFAULT_COMPACTION_CONFIG.responsesApis,
 		]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
 		expect(loaded.config.webSearch).toEqual({
 			...DEFAULT_WEB_SEARCH_CONFIG,
 			models: [...DEFAULT_WEB_SEARCH_CONFIG.models],
@@ -69,7 +70,7 @@ describe("loadToolkitConfig", () => {
 			JSON.stringify({
 				compaction: {
 					enabled: true,
-					contextManagement: "remote",
+					contextManagement: "auto",
 					allowCompactionContinuityBreak: true,
 					remoteCompactModel: " uwoacrimson/gpt-5.6-luna ",
 					nativeFallback: {
@@ -112,12 +113,12 @@ describe("loadToolkitConfig", () => {
 			}),
 		);
 
-		const loaded = loadToolkitConfig(configPath);
+		const loaded = loadToolkitConfig(configPath, path.join(path.dirname(configPath), "settings.json"));
 
 		expect(loaded.source).toBe(configPath);
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.compaction.allowCompactionContinuityBreak).toBe(true);
-		expect(loaded.config.compaction.contextManagement).toBe("remote");
+		expect(loaded.config.compaction.contextManagement).toBe("auto");
 		expect(loaded.config.compaction).not.toHaveProperty("codexGatewayModels");
 		expect(loaded.config.compaction.remoteCompactModel).toBe("uwoacrimson/gpt-5.6-luna");
 		expect(loaded.config.compaction.nativeFallback).toEqual({
@@ -159,6 +160,22 @@ describe("loadToolkitConfig", () => {
 			circuitBreaker: { consecutiveDenials: 4, recentDenials: 12, windowSize: 40 },
 		});
 		expect(loaded.config).not.toHaveProperty("codexAstra");
+	});
+
+	test("reads the hosted native Codex allowlist from settings without rewriting it", () => {
+		const configPath = writeTempConfig(JSON.stringify({
+			compaction: { gatewayContextModels: ["ignored/config-value"] },
+		}));
+		const settingsPath = path.join(path.dirname(configPath), "settings.json");
+		const settings = JSON.stringify({
+			openaiToolkit: { codexContextModels: ["openai-codex/gpt-5.6-sol"] },
+			otherSetting: true,
+		}, null, 2) + "\n";
+		fs.writeFileSync(settingsPath, settings, "utf8");
+
+		const loaded = loadToolkitConfig(configPath, settingsPath);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual(["openai-codex/gpt-5.6-sol"]);
+		expect(fs.readFileSync(settingsPath, "utf8")).toBe(settings);
 	});
 
 	test("a retired codexAstra section warns as an unknown field without crashing", () => {
@@ -235,7 +252,7 @@ describe("loadToolkitConfig", () => {
 	test("contextReminderThresholdPercent accepts 0-100 and ignores out-of-range", () => {
 		const configPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 10 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 10 },
 			}),
 		);
 		const loaded = loadToolkitConfig(configPath);
@@ -244,7 +261,7 @@ describe("loadToolkitConfig", () => {
 
 		const disabledPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 0 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 0 },
 			}),
 		);
 		const disabled = loadToolkitConfig(disabledPath);
@@ -253,7 +270,7 @@ describe("loadToolkitConfig", () => {
 
 		const invalidPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 150 },
+				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 150 },
 			}),
 		);
 		const invalid = loadToolkitConfig(invalidPath);
@@ -321,7 +338,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.compaction.nativeFallback).toEqual({ ...DEFAULT_NATIVE_FALLBACK_CONFIG });
 		expect(loaded.config.compaction).not.toHaveProperty("autoCompaction");
 		expect(loaded.config.compaction.responsesApis).toEqual(["openai-responses"]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
 		expect(loaded.config.webSearch).toEqual({ enabled: true, models: ["provider/model"] });
 		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["gpt-image-2.5"] });
 		expect(loaded.config.autoMode).toEqual({
@@ -440,15 +457,15 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.autoMode.enabled).toBe(true);
 	});
 
-	test("contextManagement accepts only trimmed off/remote values and warns for local/tree/invalid values", () => {
-		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " remote " } }));
-		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("remote");
+	test("contextManagement accepts only trimmed auto/off values and warns for local/tree/invalid values", () => {
+		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " auto " } }));
+		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("auto");
 
 		const invalidPath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: "local" } }));
 		const invalid = loadToolkitConfig(invalidPath);
 		expect(invalid.config.compaction.contextManagement).toBe("off");
 		expect(invalid.warnings).toEqual([
-			"Ignoring compaction.contextManagement: expected one of off, remote.",
+			"Ignoring compaction.contextManagement: expected one of auto, off.",
 		]);
 	});
 

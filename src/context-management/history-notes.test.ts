@@ -1,5 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import { afterEach, expect, test } from "bun:test";
 import { callHistoryNotesBackend, executeHistoryNotesTool, HISTORY_ENDPOINTS, NOTES_ENDPOINTS } from "./history-notes";
+import { localSessionRoot } from "./local-paths";
+import { unregisterLocalHistorySource } from "./history-source";
 
 const originalFetch = globalThis.fetch;
 const model = {
@@ -71,9 +75,37 @@ test("surfaces abort, HTTP and malformed JSON failures without response-body lea
 	expect(malformed).toMatchObject({ ok: false, reason: "invalid-json" });
 });
 
-test("returns encrypted output as an opaque top-level tool result", async () => {
+test("defaults history and notes tools to the local backend", async () => {
+	const sessionId = randomUUID();
+	const entries = [{
+		type: "message", id: "history-item", parentId: null, timestamp: "2026-09-07T00:00:00.000Z",
+		message: { role: "user", content: "local history entry" },
+	}];
+	const localCtx = {
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getEntries: () => entries,
+			getSessionFile: () => undefined,
+		},
+	} as never;
+	const root = localSessionRoot(localCtx);
+	globalThis.fetch = async () => { throw new Error("local tools must not fetch a hosted backend"); };
+	try {
+		const written = await executeHistoryNotesTool("notes", "write_file", {
+			action: "write_file", path: "state.md", text: "local note",
+		}, localCtx);
+		expect(written.details?.codexHistoryNotes).toBeUndefined();
+		const history = await executeHistoryNotesTool("history", "list_items", { action: "list_items" }, localCtx);
+		expect(history.content[0]?.text).toContain("local history entry");
+	} finally {
+		unregisterLocalHistorySource(localCtx);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("remote compatibility utility returns encrypted output as an opaque top-level tool result", async () => {
 	globalThis.fetch = async () => new Response(JSON.stringify({ encrypted_output: "opaque-value", extra: "kept" }), { status: 200 });
-	const result = await executeHistoryNotesTool("history", "list_windows", { action: "list_windows" }, ctx);
+	const result = await executeHistoryNotesTool("history", "list_windows", { action: "list_windows" }, ctx, undefined, [], "remote");
 	expect(result.content).toEqual([{ type: "text", text: "history operation completed" }]);
 	expect(result.details?.codexHistoryNotes).toEqual({ encrypted_output: "opaque-value", extra: "kept" });
 });

@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { executeHistoryNotesTool, type CodexHistoryNotesDetails } from "./history-notes";
 import { type CodexContextWindowManager } from "./window-manager";
+import type { ContextStatusDetails } from "./context-observer";
 import {
 	HISTORY_ACTION_FIELDS,
 	HISTORY_ENDPOINTS,
@@ -72,6 +73,8 @@ export interface ContextRemainingDetails {
 	remainingTokens?: number;
 	windowId?: string;
 	contextWindow: number;
+	/** Additive observability fields; the legacy token fields above remain unchanged. */
+	status: ContextStatusDetails;
 }
 
 export type ContextManagementTools = {
@@ -86,21 +89,24 @@ export function createContextManagementTools(
 	manager: CodexContextWindowManager,
 	isActive: (ctx: ExtensionContext) => Promise<boolean> | boolean,
 	getGatewayModels: () => readonly string[] = () => [],
+	getBackend: (ctx: ExtensionContext) => "remote" | "local" = () => "local",
 ): ContextManagementTools {
 	const assertActive = async (ctx: ExtensionContext): Promise<void> => {
-		if (!(await isActive(ctx))) throw new Error("remote-context-inactive");
+		if (!(await isActive(ctx))) throw new Error("local-context-inactive");
 	};
 	const newContext: ToolDefinition<typeof NEW_CONTEXT_PARAMETERS, NewContextDetails> = {
 		name: "new_context",
 		label: "new_context",
-		description: "Start a new remote Codex context window without generating a conversation summary. Requires a successful notes checkpoint in the current window unless force is set.",
+		description: "Start a new context window without generating a conversation summary. Requires a successful notes checkpoint in the current window unless force is set.",
 		parameters: NEW_CONTEXT_PARAMETERS,
-		promptSnippet: "Start a new remote Codex context window without summarizing history.",
+		promptSnippet: "Start a new context window without summarizing history.",
 		promptGuidelines: ["Checkpoint active work in notes before calling new_context; no conversation summary carries over. A successful notes append/write in this window is required unless the user explicitly accepts discarding unsaved state (force=true)."],
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
 			await assertActive(ctx);
+			manager.recordRolloverRequested(ctx);
 			if (!params.force && !manager.hasNotesCheckpointSinceBoundary(ctx)) {
+				manager.recordRolloverRefused(ctx, "notes-checkpoint-required");
 				throw new Error(NEW_CONTEXT_CHECKPOINT_REQUIRED_MESSAGE);
 			}
 			const started = await manager.startNewWindow(pi, ctx, {
@@ -117,23 +123,23 @@ export function createContextManagementTools(
 	const getContextRemaining: ToolDefinition<typeof EMPTY_PARAMETERS, ContextRemainingDetails> = {
 		name: "get_context_remaining",
 		label: "get_context_remaining",
-		description: "Get the remaining tokens in the current remote Codex context window.",
+		description: "Get the remaining tokens in the current context window.",
 		parameters: EMPTY_PARAMETERS,
 		async execute(_id, _params, _signal, _update, ctx) {
 			await assertActive(ctx);
 			const remaining = manager.remaining(ctx);
 			return {
 				content: [{ type: "text", text: remaining.remainingTokens === undefined ? "You have unknown tokens left in this context window." : `You have ${remaining.remainingTokens} tokens left in this context window.` }],
-				details: remaining,
+				details: { ...remaining, status: manager.contextStatus(ctx) },
 			};
 		},
 	};
 	const history: ToolDefinition<typeof HISTORY_PARAMETERS, CodexHistoryNotesDetails> = {
 		name: "history",
 		label: "history",
-		description: "Search or read prior remote Codex context-window history. Pass IDs unchanged.",
+		description: "Search or read prior context-window history. Pass IDs unchanged.",
 		parameters: HISTORY_PARAMETERS,
-		promptSnippet: "Search or read prior remote Codex context-window history.",
+		promptSnippet: "Search or read prior context-window history; default to the current agent.",
 		promptGuidelines: [
 			"When the user asks about decisions, code, or details from earlier in the conversation that are no longer in the current context window, use history first instead of relying on fragments that survived compaction.",
 			"Use read_item with the exact item_id returned by list_items or search_contents; never rewrite, truncate, or guess IDs.",
@@ -143,15 +149,15 @@ export function createContextManagementTools(
 		],
 		execute: async (_id, params, _signal, _update, ctx) => {
 			await assertActive(ctx);
-			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels());
+			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels(), getBackend(ctx));
 		},
 	};
 	const notes: ToolDefinition<typeof NOTES_PARAMETERS, CodexHistoryNotesDetails> = {
 		name: "notes",
 		label: "notes",
-		description: "Read and checkpoint remote Codex notes across context windows.",
+		description: "Read and checkpoint notes across context windows.",
 		parameters: NOTES_PARAMETERS,
-		promptSnippet: "Read and checkpoint remote Codex notes across context windows.",
+		promptSnippet: "Read and checkpoint agent-scoped notes across context windows within this task.",
 		promptGuidelines: [
 			"Before calling new_context, checkpoint the current turn's active work (unfinished tasks, decisions, open questions, references) into notes with append_to_file or write_file so it survives the window change.",
 			"When a large task spans multiple context windows, keep a running note per line of work and read it at the start of each new window; append new state instead of replacing it unless the note is stale.",
@@ -162,7 +168,18 @@ export function createContextManagementTools(
 		executionMode: "sequential",
 		execute: async (_id, params, _signal, _update, ctx) => {
 			await assertActive(ctx);
-			return executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels());
+			const result = await executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels(), getBackend(ctx));
+			if (params.action === "append_to_file" || params.action === "write_file") {
+				const value = result.details.contextManagement;
+				const file = value.file && typeof value.file === "object" && !Array.isArray(value.file)
+					? value.file as Record<string, unknown>
+					: undefined;
+				const sizeBytes = typeof file?.size_bytes === "number" && Number.isFinite(file.size_bytes)
+					? file.size_bytes
+					: undefined;
+				manager.recordNotesCheckpoint(ctx, sizeBytes);
+			}
+			return result;
 		},
 	};
 	return { newContext, getContextRemaining, history, notes };
@@ -295,9 +312,10 @@ export function registerContextManagementTools(
 	manager: CodexContextWindowManager,
 	isActive: (ctx: ExtensionContext) => Promise<boolean> | boolean,
 	getGatewayModels?: () => readonly string[],
+	getBackend?: (ctx: ExtensionContext) => "remote" | "local",
 ): ContextManagementToolController {
 	const controller = new ContextManagementToolController(pi);
-	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels));
+	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels, getBackend));
 	return controller;
 }
 
