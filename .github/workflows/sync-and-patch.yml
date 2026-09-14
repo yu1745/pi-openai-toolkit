@@ -1,9 +1,11 @@
 name: Sync Upstream & Apply Patch
 
+# on:
+#   schedule:
+#     # 每天 UTC 20:00 (北京时间凌晨 04:00) 自动同步
+#     - cron: '0 20 * * *'
+#   workflow_dispatch:
 on:
-  schedule:
-    # 每天 UTC 20:00 (北京时间凌晨 04:00) 自动同步
-    - cron: '0 20 * * *'
   workflow_dispatch:
 
 jobs:
