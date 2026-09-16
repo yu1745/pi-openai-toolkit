@@ -88,10 +88,6 @@ Remote data migration is explicitly not promised. The local-file lock assumes a 
 
 A single tool result may still aggregate many bounded items. Output budgeting, history attachments and full-text fidelity need separate parity work before claiming a drop-in remote replacement. The remote service implementation is not public; mock/contract parity is not proof of identical server semantics.
 
-## Optional semantic recall
-
-A future zvec-grep integration should be a separate, optional semantic retrieval path, not a change to `search_contents`' literal contract. Apply task/agent scope **before retrieval**, return source session/window/item identifiers, and verify candidates with exact history reads. JSONL/SQLite remains the authoritative retrieval surface. Do not automatically create an embedding index or send history to a remote embedding service just because context management is enabled.
-
 ## Public references
 
 - [Codex history/notes tool contract](https://github.com/openai/codex/blob/1715e55076737158ba61d43158ede504de6d4ce1/codex-rs/ext/history-notes/src/tools.rs)
