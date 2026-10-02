@@ -123,16 +123,16 @@
     "typecheck": "tsc -p tsconfig.check.json"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": ">=0.87.0",
-    "@earendil-works/pi-ai": ">=0.87.0",
-    "@earendil-works/pi-coding-agent": ">=0.87.0",
-    "@earendil-works/pi-tui": ">=0.87.0"
+    "@earendil-works/pi-agent-core": ">=1.0.0",
+    "@earendil-works/pi-ai": ">=1.0.0",
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@earendil-works/pi-tui": ">=1.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
     "@types/node": "24.12.4",
     "bun": "1.2.23",
     "typescript": "5.9.3"
