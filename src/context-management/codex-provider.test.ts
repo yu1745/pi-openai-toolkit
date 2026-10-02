@@ -46,6 +46,9 @@ test("resolves native Codex auth from ModelRegistry and preserves account/header
 	expect(result.provider.token).toBe(token);
 	expect(result.provider.accountId).toBe("account-1");
 	expect(result.provider.headers["x-test"]).toBe("keep");
+	const headers = codexContextProviderHeaders(result.provider);
+	expect(headers.get("version")).toBeNull();
+	expect(codexContextProviderHeaders({ ...result.provider, headers: { Version: "0.154.0" } }).get("version")).toBe("0.154.0");
 });
 
 test("rejects a gateway or other provider even when Codex OAuth is available", async () => {
@@ -125,6 +128,7 @@ test("preserves the bare gateway model and affinity headers", () => {
 	expect(headers.get("X-Codex-Model")).toBe("gpt-5.5");
 	expect(headers.get("X-Codex-Affinity-Scope")).toBe("codex-session-v1");
 	expect(headers.get("Session-Id")).toBe("session-1");
+	expect(headers.get("version")).toBeNull();
 });
 
 test("normalizes thrown and explicit auth failures without exposing credential text", async () => {

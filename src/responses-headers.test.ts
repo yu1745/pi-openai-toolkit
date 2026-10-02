@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import {
 	buildResponsesRequestHeaders,
 	clampCodexSessionId,
-	CODEX_CLIENT_VERSION,
 	type ResponsesHeaderRuntime,
 } from "./responses-headers";
 
@@ -23,13 +22,13 @@ function runtimeFor(api: string, apiKey: string, sessionId?: string): ResponsesH
 	};
 }
 
-test("codex requests carry the backend version gate and conversation affinity headers", () => {
+test("native Codex requests carry identity and affinity without a default version", () => {
 	const headers = buildResponsesRequestHeaders(
 		runtimeFor("openai-codex-responses", codexJwt("acct_1"), "sess-42"),
 		{ accept: "application/json" },
 	);
 
-	expect(headers.get("version")).toBe(CODEX_CLIENT_VERSION);
+	expect(headers.get("version")).toBeNull();
 	expect(headers.get("chatgpt-account-id")).toBe("acct_1");
 	expect(headers.get("originator")).toBe("pi");
 	expect(headers.get("openai-beta")).toBe("responses=experimental");
@@ -43,7 +42,7 @@ test("codex affinity headers are omitted without a session id", () => {
 		{ accept: "application/json" },
 	);
 
-	expect(headers.get("version")).toBe(CODEX_CLIENT_VERSION);
+	expect(headers.get("version")).toBeNull();
 	expect(headers.get("session-id")).toBeNull();
 	expect(headers.get("x-client-request-id")).toBeNull();
 });
@@ -75,12 +74,12 @@ test("non-codex responses requests never carry codex headers", () => {
 
 test("codex version header respects an explicit null override from provider headers", () => {
 	const runtime = runtimeFor("openai-codex-responses", codexJwt("acct_1"), "sess-42");
+	runtime.currentModel.headers = { Version: "0.154.0" };
 	runtime.headers = { version: null };
 	const headers = buildResponsesRequestHeaders(runtime, { accept: "application/json" });
 
-	// null is Pi's deletion semantics for configured headers; the codex block
-	// re-asserts its own required values afterwards, so the gate stays present.
-	expect(headers.get("version")).toBe(CODEX_CLIENT_VERSION);
+	// Null deletes an explicitly configured version; native headers do not restore it.
+	expect(headers.get("version")).toBeNull();
 });
 
 test("buildResponsesRequestHeaders falls back to the runtime session id", () => {
@@ -89,4 +88,10 @@ test("buildResponsesRequestHeaders falls back to the runtime session id", () => 
 		{ accept: "application/json" },
 	);
 	expect(headers.get("session-id")).toBe("runtime-sess");
+});
+
+test("native requests preserve an explicitly configured version", () => {
+	const runtime = runtimeFor("openai-codex-responses", codexJwt("acct_1"));
+	runtime.headers = { Version: "0.154.0" };
+	expect(buildResponsesRequestHeaders(runtime, { accept: "application/json" }).get("version")).toBe("0.154.0");
 });

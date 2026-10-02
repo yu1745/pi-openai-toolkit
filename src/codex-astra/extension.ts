@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ASTRA_MODEL_ID } from "../types";
-import { CODEX_CLIENT_VERSION } from "../responses-headers";
 import {
 	getEffortControlState,
 	planStableEffort,
@@ -102,19 +101,6 @@ export function registerCodexAstraExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("before_provider_headers", (event, ctx) => {
-		try {
-			const model = ctx.model;
-			if (!model || model.api !== "openai-codex-responses") return;
-			// Live requests need the same backend version gate as our synthetic
-			// ones: an old or missing `version` never reaches gated SKUs.
-			if (!event.headers.version) {
-				event.headers.version = CODEX_CLIENT_VERSION;
-			}
-		} catch {
-			// Header injection is best-effort.
-		}
-	});
 }
 
 export default function codexAstraExtension(pi: ExtensionAPI): void {

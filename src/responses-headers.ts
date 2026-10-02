@@ -39,13 +39,7 @@ function buildCodexUserAgent(): string {
 	return `pi (${platform}; ${arch})`;
 }
 
-/**
- * The Codex backend version-gates model availability on the `version` header
- * (the pinned @openai/codex client version). `gpt-6-astra` requires >= 0.153.0;
- * an older or absent pin makes the SKU invisible to discovery and rejects
- * requests that name it. Keep this in sync with the newest gate Oh My Pi pins
- * in @oh-my-pi/pi-wire/codex (`CODEX_CLIENT_VERSION`).
- */
+/** Codex client identity for gateway User-Agent values, not a native version pin. */
 export const CODEX_CLIENT_VERSION = "0.153.0";
 
 /** Prompt cache keys are clamped by the same host rule (`OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`). */
@@ -83,9 +77,6 @@ export function buildResponsesRequestHeaders(
 		headers.set("originator", "pi");
 		headers.set("user-agent", buildCodexUserAgent());
 		headers.set("openai-beta", "responses=experimental");
-		// Codex backend gating: a request without a new-enough `version` never
-		// reaches model SKUs that arrived behind the gate (gpt-6-astra).
-		headers.set("version", CODEX_CLIENT_VERSION);
 		// Prompt-cache affinity rides on the conversation identity: the backend
 		// keeps a conversation's cache prefix on the node that wrote it, so our
 		// synthetic compaction requests must present the same id the live
