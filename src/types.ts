@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ConfigDocumentSnapshot } from "./config/policy";
 import type { CompactionEntry, CompactionResult, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const TOOLKIT_ID = "pi-openai-toolkit";
@@ -12,17 +13,31 @@ export const REDACTED_VALUE = "[REDACTED]";
  * APIs the extension knows how to build a `/responses/compact` URL for.
  * `compaction.responsesApis` in config.json may only narrow this set.
  */
-export const RESPONSES_COMPACT_CAPABLE_APIS = ["openai-responses", "openai-codex-responses"] as const;
+export const RESPONSES_COMPACT_CAPABLE_APIS = [
+	"openai-responses",
+	"openai-codex-responses",
+	"azure-openai-responses",
+] as const;
 /**
- * The Codex model whose Astra compatibility layer matches this bare model id.
- * Hosted no-summary Context Management is separately gated by the configured
- * native Codex provider/model allowlist.
+ * Bare model ID used by the independent Astra effort compatibility layer.
+ * Remote Context eligibility is API/provider based with an exact gateway opt-in;
+ * this constant does not verify backend support or grant that opt-in.
  */
 export const ASTRA_MODEL_ID = "gpt-6-astra";
-
 export const LEGACY_NATIVE_COMPACTION_STRATEGY = "openai-native-compact-v1";
 export const REMOTE_V2_COMPACTION_STRATEGY = "openai-remote-compaction-v2";
 export const NATIVE_COMPACTION_STRATEGY = REMOTE_V2_COMPACTION_STRATEGY;
+/**
+ * Provenance recorded when the checkpoint input came from Pi's ordered context
+ * hook projection. Older persisted entries may omit it and must not be
+ * replayed by Remote V2.
+ */
+export const NATIVE_COMPACTION_INPUT_PROVENANCE = "pi-context-hook-v1" as const;
+/** Explicit opt-in marker for the pre-projection raw session/branch chain. */
+export const LEGACY_REMOTE_V2_INPUT_PROVENANCE = "legacy-raw-context-v1" as const;
+export type NativeCompactionInputProvenance =
+	| typeof NATIVE_COMPACTION_INPUT_PROVENANCE
+	| typeof LEGACY_REMOTE_V2_INPUT_PROVENANCE;
 /**
  * Pi currently requires CompactionResult.summary to be text. This marker is only a
  * replay shim; the provider receives the opaque item from details.compactedWindow.
@@ -45,7 +60,10 @@ export type DebugArtifactKind =
 	| "compaction-event"
 	| "lifecycle";
 
-export type ContextManagementMode = "off" | "auto";
+export type ContextManagementMode = "off" | "remote";
+
+/** How Remote V2 obtains the history it sends to the compaction endpoint. */
+export type RemoteV2ContextSource = "pi-context-hook" | "legacy";
 
 /** Native-method fallback compaction: which model runs pi's compact() and how deeply. */
 export type NativeFallbackConfig = {
@@ -61,9 +79,26 @@ export type NativeFallbackConfig = {
 	thinkingLevel: ThinkingLevel;
 };
 
+/** How the toolkit reacts when leaving remote context management would re-expand the transcript. */
+export type LeaveManagedModePolicy = "warn" | "compact";
+
+export type DebugConfig = {
+	debug: boolean;
+	notifyOnLoad: boolean;
+	logProviderPayloads: boolean;
+	logCompactResponses: boolean;
+	redactSensitiveData: boolean;
+	artifactRoot: string;
+};
+
 export type CompactionConfig = {
 	enabled: boolean;
-	/** Context windows use the hosted backend for allowlisted native Codex models and local storage for other providers. */
+	/**
+	 * What to do when the session is about to hand a model the whole durable transcript
+	 * instead of its remote window: warn, or compact the retired windows away first.
+	 */
+	leaveManagedMode: LeaveManagedModePolicy;
+	/** Optional Codex Remote Context management. Disabled by default for compatibility. */
 	contextManagement: ContextManagementMode;
 	/**
 	 * Allow a Responses session whose latest compaction was not created by this extension
@@ -75,6 +110,11 @@ export type CompactionConfig = {
 	 * remains the checkpoint consumer and continues handling normal requests.
 	 */
 	remoteCompactModel?: string;
+	/**
+	 * Remote V2 input source. Pi's patched context hook preserves the normal
+	 * provider-visible projection; legacy keeps the pre-patch raw session/branch chain.
+	 */
+	remoteV2ContextSource: RemoteV2ContextSource;
 	/** Native-method fallback compaction policy (non-Responses APIs, or when the compact endpoint fails). */
 	nativeFallback: NativeFallbackConfig;
 	/**
@@ -82,9 +122,9 @@ export type CompactionConfig = {
 	 */
 	responsesApis: string[];
 	/**
-	 * Exact native Codex provider/model keys allowed to use hosted no-summary
-	 * context windows. This allowlist is synchronized from
-	 * settings.json openaiToolkit.codexContextModels when present.
+	 * Exact "provider/model" keys allowed to use Codex Remote Context on the
+	 * `openai-responses` gateway wire. The native `openai-codex` route ignores
+	 * this list; gateway coverage is opt-in per model.
 	 */
 	gatewayContextModels: string[];
 	/**
@@ -100,18 +140,24 @@ export type CompactionConfig = {
 	artifactRoot: string;
 };
 
+export type WebSearchRoute = "local" | "hosted" | "standalone-alpha";
+
 export type WebSearchConfig = {
 	enabled: boolean;
 	/** Exact provider/model keys allowed to use toolkit-native Web Search. */
 	models: string[];
+	/** Explicit route for every model not matched by `routes`. */
+	defaultRoute?: WebSearchRoute;
+	/** Exact `provider/model-id` overrides; no globs or fuzzy matching. */
+	routes?: Record<string, WebSearchRoute>;
 };
 
 export type ImageGenerationConfig = {
 	enabled: boolean;
 	/**
-	 * Bare `image_generation` tool model ids this toolkit may send, without a `provider/` prefix.
-	 * The first entry is the default; `openai_generate_image`'s optional `model` argument may
-	 * select any other entry in this order-preserving list.
+	 * Bare Images API model ids this toolkit may send, without a `provider/` prefix.
+	 * The first legacy entry is the default; `openai_generate_image`'s optional `model` argument
+	 * may select any other entry in this order-preserving list.
 	 */
 	models: string[];
 };
@@ -184,7 +230,10 @@ export type ToolkitConfig = {
 };
 
 export type LoadedToolkitConfig = {
+	/** Legacy normalization seam. Feature entrypoints must resolve this snapshot for their model. */
 	config: ToolkitConfig;
+	/** Optional only for existing injected legacy readers; real loads always include it. */
+	document?: ConfigDocumentSnapshot;
 	/** Path of the config file that was applied, if it existed and parsed. */
 	source?: string;
 	warnings: string[];
@@ -253,6 +302,12 @@ export type DeferredToolCarryoverV1 = {
 
 export type NativeCompactionDetails = NativeCompactionIdentity & {
 	strategy: NativeCompactionStrategy;
+	/**
+	 * Input source recorded for checkpoints created by this extension. Older
+	 * persisted entries may omit it and must not be treated as verified for
+	 * Remote V2 replay.
+	 */
+	inputProvenance?: NativeCompactionInputProvenance;
 	/** Actual producer of the opaque checkpoint; absent on legacy same-model entries. */
 	compactionModel?: NativeCompactionIdentity;
 	/** Cache-stack activation state captured at this opaque checkpoint. */
@@ -266,6 +321,7 @@ export type NativeCompactionDetails = NativeCompactionIdentity & {
 export type NativeCompactionEntry = CompactionEntry<NativeCompactionDetails>;
 
 export type CreateNativeCompactionDetailsInput = NativeCompactionIdentity & {
+	inputProvenance: NativeCompactionInputProvenance;
 	compactionModel?: NativeCompactionIdentity;
 	deferredToolCarryover?: DeferredToolCarryoverV1;
 	compactedWindow: unknown[];
@@ -381,6 +437,16 @@ export function isNativeCompactionIdentity(value: unknown): value is NativeCompa
 	);
 }
 
+export function isNativeCompactionInputProvenance(value: unknown): value is NativeCompactionInputProvenance {
+	return value === NATIVE_COMPACTION_INPUT_PROVENANCE || value === LEGACY_REMOTE_V2_INPUT_PROVENANCE;
+}
+
+export function getRemoteV2InputProvenance(source: RemoteV2ContextSource): NativeCompactionInputProvenance {
+	return source === "pi-context-hook"
+		? NATIVE_COMPACTION_INPUT_PROVENANCE
+		: LEGACY_REMOTE_V2_INPUT_PROVENANCE;
+}
+
 export function isDeferredToolCarryover(value: unknown): value is DeferredToolCarryoverV1 {
 	if (!isRecord(value) || value.version !== 1 || value.source !== CACHE_STACK_ACTIVATION_ENTRY_TYPE) {
 		return false;
@@ -448,6 +514,7 @@ export function isNativeCompactionDetails(value: unknown): value is NativeCompac
 	return (
 		(candidate.strategy === LEGACY_NATIVE_COMPACTION_STRATEGY ||
 			candidate.strategy === REMOTE_V2_COMPACTION_STRATEGY) &&
+		(candidate.inputProvenance === undefined || isNativeCompactionInputProvenance(candidate.inputProvenance)) &&
 		(candidate.compactionModel === undefined || isNativeCompactionIdentity(candidate.compactionModel)) &&
 		(candidate.deferredToolCarryover === undefined || isDeferredToolCarryover(candidate.deferredToolCarryover)) &&
 		Array.isArray(candidate.compactedWindow) &&
@@ -465,6 +532,7 @@ export function isNativeCompactionEntry(value: unknown): value is NativeCompacti
 export function createNativeCompactionDetails(input: CreateNativeCompactionDetailsInput): NativeCompactionDetails {
 	return {
 		strategy: NATIVE_COMPACTION_STRATEGY,
+		inputProvenance: input.inputProvenance,
 		provider: normalizeString(input.provider),
 		api: normalizeString(input.api),
 		model: normalizeString(input.model),
@@ -512,19 +580,17 @@ export const DEFAULT_NATIVE_FALLBACK_CONFIG: NativeFallbackConfig = {
 	thinkingLevel: "off",
 };
 
-export const DEFAULT_CODEX_CONTEXT_MODELS = [
-	"openai-codex/gpt-6-astra",
-	"openai-codex/gpt-5.6-sol",
-];
-
 export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 	enabled: true,
 	contextManagement: "off",
 	allowCompactionContinuityBreak: false,
 	remoteCompactModel: undefined,
+	remoteV2ContextSource: "legacy",
+
 	nativeFallback: { ...DEFAULT_NATIVE_FALLBACK_CONFIG },
 	responsesApis: [...RESPONSES_COMPACT_CAPABLE_APIS],
-	gatewayContextModels: [...DEFAULT_CODEX_CONTEXT_MODELS],
+	gatewayContextModels: [],
+	leaveManagedMode: "warn",
 	contextReminderThresholdPercent: 5,
 	notifyOnLoad: false,
 	debug: false,
@@ -540,7 +606,7 @@ export const DEFAULT_WEB_SEARCH_CONFIG: WebSearchConfig = {
 };
 
 /** Single source of truth for the hosted image model used when nothing is configured. */
-export const DEFAULT_IMAGE_GENERATION_MODEL = "gpt-image-2.5";
+export const DEFAULT_IMAGE_GENERATION_MODEL = "grok-imagine-image-2.0";
 export const DEFAULT_IMAGE_GENERATION_MODELS: readonly string[] = [DEFAULT_IMAGE_GENERATION_MODEL];
 
 export const DEFAULT_IMAGE_GENERATION_CONFIG: ImageGenerationConfig = {

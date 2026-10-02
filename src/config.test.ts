@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { CONFIG_PATH, loadToolkitConfig } from "./config";
 import {
 	DEFAULT_AUTO_MODE_CONFIG,
-	DEFAULT_CODEX_CONTEXT_MODELS,
 	DEFAULT_COMPACTION_CONFIG,
 	DEFAULT_IMAGE_GENERATION_CONFIG,
 	DEFAULT_NATIVE_FALLBACK_CONFIG,
@@ -38,25 +37,27 @@ describe("loadToolkitConfig", () => {
 
 	test("missing file yields independent defaults without warnings", () => {
 		const missingPath = path.join(os.tmpdir(), "pi-openai-toolkit-missing", "config.json");
-		const loaded = loadToolkitConfig(missingPath, `${missingPath}.settings.json`);
+		const loaded = loadToolkitConfig(missingPath);
 
 		expect(loaded.source).toBeUndefined();
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.compaction.enabled).toBe(true);
 		expect(loaded.config.compaction.allowCompactionContinuityBreak).toBe(false);
 		expect(loaded.config.compaction.contextManagement).toBe("off");
+		expect(loaded.config.compaction.leaveManagedMode).toBe("warn");
 		expect(loaded.config.compaction.remoteCompactModel).toBeUndefined();
+		expect(loaded.config.compaction.remoteV2ContextSource).toBe("legacy");
 		expect(loaded.config.compaction.nativeFallback).toEqual({ ...DEFAULT_NATIVE_FALLBACK_CONFIG });
 		expect(loaded.config.compaction).not.toHaveProperty("autoCompaction");
 		expect(loaded.config.compaction.responsesApis).toEqual([
 			...DEFAULT_COMPACTION_CONFIG.responsesApis,
 		]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
 		expect(loaded.config.webSearch).toEqual({
 			...DEFAULT_WEB_SEARCH_CONFIG,
 			models: [...DEFAULT_WEB_SEARCH_CONFIG.models],
 		});
-		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["gpt-image-2.5"] });
+		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["grok-imagine-image-2.0"] });
 		expect(loaded.config.imageGeneration.models).not.toBe(DEFAULT_IMAGE_GENERATION_CONFIG.models);
 		expect(loaded.config.autoMode).toEqual({
 			...DEFAULT_AUTO_MODE_CONFIG,
@@ -70,9 +71,11 @@ describe("loadToolkitConfig", () => {
 			JSON.stringify({
 				compaction: {
 					enabled: true,
-					contextManagement: "auto",
+					contextManagement: "remote",
+					leaveManagedMode: " compact ",
 					allowCompactionContinuityBreak: true,
 					remoteCompactModel: " uwoacrimson/gpt-5.6-luna ",
+					remoteV2ContextSource: " legacy ",
 					nativeFallback: {
 						enabled: true,
 						model: " google/gemini-2.5-flash ",
@@ -90,7 +93,7 @@ describe("loadToolkitConfig", () => {
 				},
 				imageGeneration: {
 					enabled: false,
-					models: [" gpt-image-2 ", "grok-imagine-image-2.0", "", "grok-imagine-image-2.0"],
+					models: [" test-image-model ", "grok-imagine-image-2.0", "", "grok-imagine-image-2.0"],
 				},
 				autoMode: {
 					enabled: true,
@@ -113,14 +116,16 @@ describe("loadToolkitConfig", () => {
 			}),
 		);
 
-		const loaded = loadToolkitConfig(configPath, path.join(path.dirname(configPath), "settings.json"));
+		const loaded = loadToolkitConfig(configPath);
 
 		expect(loaded.source).toBe(configPath);
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.compaction.allowCompactionContinuityBreak).toBe(true);
-		expect(loaded.config.compaction.contextManagement).toBe("auto");
+		expect(loaded.config.compaction.contextManagement).toBe("remote");
+		expect(loaded.config.compaction.leaveManagedMode).toBe("compact");
 		expect(loaded.config.compaction).not.toHaveProperty("codexGatewayModels");
 		expect(loaded.config.compaction.remoteCompactModel).toBe("uwoacrimson/gpt-5.6-luna");
+		expect(loaded.config.compaction.remoteV2ContextSource).toBe("legacy");
 		expect(loaded.config.compaction.nativeFallback).toEqual({
 			enabled: true,
 			model: "google/gemini-2.5-flash",
@@ -139,7 +144,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.webSearch).toEqual({ enabled: false, models: ["provider/model"] });
 		expect(loaded.config.imageGeneration).toEqual({
 			enabled: false,
-			models: ["gpt-image-2", "grok-imagine-image-2.0"],
+			models: ["test-image-model", "grok-imagine-image-2.0"],
 		});
 		expect(loaded.config.autoMode).toEqual({
 			enabled: true,
@@ -160,22 +165,6 @@ describe("loadToolkitConfig", () => {
 			circuitBreaker: { consecutiveDenials: 4, recentDenials: 12, windowSize: 40 },
 		});
 		expect(loaded.config).not.toHaveProperty("codexAstra");
-	});
-
-	test("reads the hosted native Codex allowlist from settings without rewriting it", () => {
-		const configPath = writeTempConfig(JSON.stringify({
-			compaction: { gatewayContextModels: ["ignored/config-value"] },
-		}));
-		const settingsPath = path.join(path.dirname(configPath), "settings.json");
-		const settings = JSON.stringify({
-			openaiToolkit: { codexContextModels: ["openai-codex/gpt-5.6-sol"] },
-			otherSetting: true,
-		}, null, 2) + "\n";
-		fs.writeFileSync(settingsPath, settings, "utf8");
-
-		const loaded = loadToolkitConfig(configPath, settingsPath);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual(["openai-codex/gpt-5.6-sol"]);
-		expect(fs.readFileSync(settingsPath, "utf8")).toBe(settings);
 	});
 
 	test("a retired codexAstra section warns as an unknown field without crashing", () => {
@@ -252,7 +241,7 @@ describe("loadToolkitConfig", () => {
 	test("contextReminderThresholdPercent accepts 0-100 and ignores out-of-range", () => {
 		const configPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 10 },
+				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 10 },
 			}),
 		);
 		const loaded = loadToolkitConfig(configPath);
@@ -261,7 +250,7 @@ describe("loadToolkitConfig", () => {
 
 		const disabledPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 0 },
+				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 0 },
 			}),
 		);
 		const disabled = loadToolkitConfig(disabledPath);
@@ -270,7 +259,7 @@ describe("loadToolkitConfig", () => {
 
 		const invalidPath = writeTempConfig(
 			JSON.stringify({
-				compaction: { contextManagement: "auto", contextReminderThresholdPercent: 150 },
+				compaction: { contextManagement: "remote", contextReminderThresholdPercent: 150 },
 			}),
 		);
 		const invalid = loadToolkitConfig(invalidPath);
@@ -300,6 +289,7 @@ describe("loadToolkitConfig", () => {
 				compaction: {
 					enabled: "yes",
 					allowCompactionContinuityBreak: "yes",
+					remoteV2ContextSource: "raw",
 					remoteCompactModel: { provider: "uwoacrimson" },
 					nativeFallback: {
 						enabled: "yes",
@@ -334,13 +324,14 @@ describe("loadToolkitConfig", () => {
 
 		expect(loaded.config.compaction.enabled).toBe(true);
 		expect(loaded.config.compaction.allowCompactionContinuityBreak).toBe(false);
+		expect(loaded.config.compaction.remoteV2ContextSource).toBe("legacy");
 		expect(loaded.config.compaction.remoteCompactModel).toBeUndefined();
 		expect(loaded.config.compaction.nativeFallback).toEqual({ ...DEFAULT_NATIVE_FALLBACK_CONFIG });
 		expect(loaded.config.compaction).not.toHaveProperty("autoCompaction");
 		expect(loaded.config.compaction.responsesApis).toEqual(["openai-responses"]);
-		expect(loaded.config.compaction.gatewayContextModels).toEqual([...DEFAULT_CODEX_CONTEXT_MODELS]);
+		expect(loaded.config.compaction.gatewayContextModels).toEqual([]);
 		expect(loaded.config.webSearch).toEqual({ enabled: true, models: ["provider/model"] });
-		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["gpt-image-2.5"] });
+		expect(loaded.config.imageGeneration).toEqual({ enabled: false, models: ["grok-imagine-image-2.0"] });
 		expect(loaded.config.autoMode).toEqual({
 			...DEFAULT_AUTO_MODE_CONFIG,
 			models: [],
@@ -364,7 +355,7 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.compaction.enabled).toBe(true);
 		expect(loaded.config.webSearch.enabled).toBe(true);
 		expect(loaded.config.imageGeneration.enabled).toBe(false);
-		expect(loaded.config.imageGeneration.models).toEqual(["gpt-image-2.5"]);
+		expect(loaded.config.imageGeneration.models).toEqual(["grok-imagine-image-2.0"]);
 		expect(loaded.config.autoMode.reviewerModel).toBeUndefined();
 		expect(loaded.warnings).toEqual([
 			"Ignoring legacyEnabled: unknown field.",
@@ -382,35 +373,35 @@ describe("loadToolkitConfig", () => {
 	test("imageGeneration.models keeps order, normalizes entries, and falls back with warnings", () => {
 		const customPath = writeTempConfig(
 			JSON.stringify({
-				imageGeneration: { enabled: true, models: ["grok-imagine-image-2.0", "gpt-image-2"] },
+				imageGeneration: { enabled: true, models: ["grok-imagine-image-2.0", "test-image-model"] },
 			}),
 		);
 		const custom = loadToolkitConfig(customPath);
 		expect(custom.warnings).toEqual([]);
 		expect(custom.config.imageGeneration).toEqual({
 			enabled: true,
-			models: ["grok-imagine-image-2.0", "gpt-image-2"],
+			models: ["grok-imagine-image-2.0", "test-image-model"],
 		});
 
 		const emptyPath = writeTempConfig(JSON.stringify({ imageGeneration: { models: [] } }));
 		const empty = loadToolkitConfig(emptyPath);
-		expect(empty.config.imageGeneration.models).toEqual(["gpt-image-2.5"]);
+		expect(empty.config.imageGeneration.models).toEqual(["grok-imagine-image-2.0"]);
 		expect(empty.warnings).toEqual([
-			"Ignoring imageGeneration.models: expected at least one model id; using gpt-image-2.5.",
+			"Ignoring imageGeneration.models: expected at least one model id; using grok-imagine-image-2.0.",
 		]);
 
 		const blankPath = writeTempConfig(JSON.stringify({ imageGeneration: { models: [" ", "\t"] } }));
 		const blank = loadToolkitConfig(blankPath);
-		expect(blank.config.imageGeneration.models).toEqual(["gpt-image-2.5"]);
+		expect(blank.config.imageGeneration.models).toEqual(["grok-imagine-image-2.0"]);
 		expect(blank.warnings).toEqual([
-			"Ignoring imageGeneration.models: expected at least one model id; using gpt-image-2.5.",
+			"Ignoring imageGeneration.models: expected at least one model id; using grok-imagine-image-2.0.",
 		]);
 
 		const malformedPath = writeTempConfig(
-			JSON.stringify({ imageGeneration: { models: ["gpt-image-2", 42] } }),
+			JSON.stringify({ imageGeneration: { models: ["test-image-model", 42] } }),
 		);
 		const malformed = loadToolkitConfig(malformedPath);
-		expect(malformed.config.imageGeneration.models).toEqual(["gpt-image-2.5"]);
+		expect(malformed.config.imageGeneration.models).toEqual(["grok-imagine-image-2.0"]);
 		expect(malformed.warnings).toEqual([
 			"Ignoring imageGeneration.models: expected a string array.",
 		]);
@@ -421,7 +412,7 @@ describe("loadToolkitConfig", () => {
 			}),
 		);
 		const oversized = loadToolkitConfig(oversizedPath);
-		expect(oversized.config.imageGeneration.models).toEqual(["gpt-image-2.5"]);
+		expect(oversized.config.imageGeneration.models).toEqual(["grok-imagine-image-2.0"]);
 		expect(oversized.warnings).toEqual([
 			"Ignoring imageGeneration.models: each model id must be at most 256 characters.",
 		]);
@@ -457,15 +448,27 @@ describe("loadToolkitConfig", () => {
 		expect(loaded.config.autoMode.enabled).toBe(true);
 	});
 
-	test("contextManagement accepts only trimmed auto/off values and warns for local/tree/invalid values", () => {
-		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " auto " } }));
-		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("auto");
+	test("contextManagement accepts only trimmed off/remote values and warns for local/tree/invalid values", () => {
+		const remotePath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: " remote " } }));
+		expect(loadToolkitConfig(remotePath).config.compaction.contextManagement).toBe("remote");
 
 		const invalidPath = writeTempConfig(JSON.stringify({ compaction: { contextManagement: "local" } }));
 		const invalid = loadToolkitConfig(invalidPath);
 		expect(invalid.config.compaction.contextManagement).toBe("off");
 		expect(invalid.warnings).toEqual([
-			"Ignoring compaction.contextManagement: expected one of auto, off.",
+			"Ignoring compaction.contextManagement: expected one of off, remote.",
+		]);
+	});
+
+	test("leaveManagedMode accepts trimmed warn/compact values and defaults on garbage", () => {
+		const compactPath = writeTempConfig(JSON.stringify({ compaction: { leaveManagedMode: " compact " } }));
+		expect(loadToolkitConfig(compactPath).config.compaction.leaveManagedMode).toBe("compact");
+
+		const invalidPath = writeTempConfig(JSON.stringify({ compaction: { leaveManagedMode: "auto" } }));
+		const invalid = loadToolkitConfig(invalidPath);
+		expect(invalid.config.compaction.leaveManagedMode).toBe("warn");
+		expect(invalid.warnings).toEqual([
+			"Ignoring compaction.leaveManagedMode: expected one of warn, compact.",
 		]);
 	});
 
@@ -495,4 +498,59 @@ test("retired autoCompaction configuration is ignored without rewriting user set
 	expect(loaded.config.compaction).not.toHaveProperty("autoCompaction");
 	expect(loaded.warnings).toEqual(["Ignoring compaction.autoCompaction: unknown field."]);
 	expect(fs.readFileSync(configPath, "utf8")).toBe(content);
+});
+
+test("webSearch routes parse with exact precedence fields and migration warnings", () => {
+	const configPath = writeTempConfig(
+		JSON.stringify({
+			webSearch: {
+				models: [" provider/model "],
+				defaultRoute: "hosted",
+				routes: {
+					" provider/model ": "local",
+					"uwoacrimson/gpt-6-astra": "standalone-alpha",
+				},
+			},
+		}),
+	);
+	const loaded = loadToolkitConfig(configPath);
+
+	expect(loaded.config.webSearch).toEqual({
+		enabled: true,
+		models: ["provider/model"],
+		defaultRoute: "hosted",
+		routes: {
+			"provider/model": "local",
+			"uwoacrimson/gpt-6-astra": "standalone-alpha",
+		},
+	});
+	expect(loaded.warnings).toEqual([
+		"webSearch.defaultRoute overrides legacy webSearch.models for models without an exact webSearch.routes entry.",
+		"webSearch.routes.provider/model overrides the legacy webSearch.models entry for the same exact model.",
+	]);
+});
+
+test("webSearch route fields reject malformed values without guessing a route", () => {
+	const configPath = writeTempConfig(
+		JSON.stringify({
+			webSearch: {
+				defaultRoute: "remote",
+				routes: {
+					bad: "local",
+					"provider/*": "hosted",
+					"provider/model": "remote",
+				},
+			},
+		}),
+	);
+	const loaded = loadToolkitConfig(configPath);
+
+	expect(loaded.config.webSearch.defaultRoute).toBeUndefined();
+	expect(loaded.config.webSearch.routes).toEqual({});
+	expect(loaded.warnings).toEqual([
+		"Ignoring webSearch.defaultRoute: expected one of local, hosted, standalone-alpha.",
+		"Ignoring webSearch.routes.bad: expected an exact \"provider/model-id\" key.",
+		"Ignoring webSearch.routes.provider/*: expected an exact \"provider/model-id\" key.",
+		"Ignoring webSearch.routes.provider/model: expected one of local, hosted, standalone-alpha.",
+	]);
 });

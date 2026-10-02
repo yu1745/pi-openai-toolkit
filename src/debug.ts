@@ -10,11 +10,11 @@ import {
 	type ArtifactSessionInfo,
 	type DebugArtifactEnvelope,
 	type DebugArtifactKind,
-	type CompactionConfig,
+	type DebugConfig,
 	type RedactOptions,
 } from "./types";
 
-const CRITICAL_KEY_RE = /(authorization|api[-_]?key|token|credential|oauth|auth|account[-_]?id|encrypted[_-]?(content|output))/i;
+const CRITICAL_KEY_RE = /(authorization|api[-_]?key|token|credential|oauth|auth|account[-_]?id|cookie|set[-_]?cookie|response(?:text)?|completed|encrypted[_-]?(content|output))/i;
 const SENSITIVE_KEY_RE = /(authorization|api[-_]?key|token|secret|password|cookie|set-cookie|signature|credential|oauth|auth|account[-_]?id|encrypted[_-]?(content|output))/i;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._\-+/=]+/gi;
 const OPENAI_KEY_RE = /\bsk-[A-Za-z0-9\-_]+\b/g;
@@ -96,7 +96,7 @@ export function redactValue(value: unknown, options: RedactOptions = {}): unknow
 	return redactWithKeyPattern(value, SENSITIVE_KEY_RE, options);
 }
 
-export function resolveArtifactPaths(settings: CompactionConfig, context: ArtifactContext): ArtifactPaths {
+export function resolveArtifactPaths(settings: DebugConfig, context: ArtifactContext): ArtifactPaths {
 	const sessionInfo = toSessionInfo(context);
 	const rootDir = settings.artifactRoot.startsWith("~/")
 		? path.join(os.homedir(), settings.artifactRoot.slice(2))
@@ -127,7 +127,7 @@ function selectArtifactDirectory(paths: ArtifactPaths, kind: DebugArtifactKind):
 	}
 }
 
-function shouldWriteArtifact(kind: DebugArtifactKind, settings: CompactionConfig): boolean {
+function shouldWriteArtifact(kind: DebugArtifactKind, settings: DebugConfig): boolean {
 	switch (kind) {
 		case "provider-request":
 			return settings.logProviderPayloads;
@@ -144,7 +144,7 @@ function shouldWriteArtifact(kind: DebugArtifactKind, settings: CompactionConfig
 export function writeDebugArtifact(
 	kind: DebugArtifactKind,
 	data: unknown,
-	settings: CompactionConfig,
+	settings: DebugConfig,
 	context: ArtifactContext,
 ): string | undefined {
 	if (!shouldWriteArtifact(kind, settings)) {
@@ -196,7 +196,7 @@ export function writeReplayFailureArtifact(
 		api?: string;
 		model?: string;
 	},
-	settings: CompactionConfig,
+	settings: DebugConfig,
 	context: ArtifactContext,
 ): string | undefined {
 	try {

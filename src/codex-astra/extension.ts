@@ -100,7 +100,6 @@ export function registerCodexAstraExtension(pi: ExtensionAPI): void {
 			return undefined;
 		}
 	});
-
 }
 
 export default function codexAstraExtension(pi: ExtensionAPI): void {

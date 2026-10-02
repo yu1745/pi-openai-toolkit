@@ -50,7 +50,7 @@ function createHarness(eligible = true) {
 	const details: ImageGenerationDetails = {
 		artifactPath: "/agent/generated-images/session/ig.png",
 		routingModel: "newapi/gpt-5.5",
-		imageModel: "gpt-image-2",
+		imageModel: "test-image-model",
 		imageCallId: "ig_test",
 		mimeType: "image/png",
 		byteCount: 100,
@@ -149,12 +149,20 @@ describe("image generation extension", () => {
 			"null",
 			"string",
 		]);
-		expect(parameters.properties.model.description).toContain("imageGeneration.models");
-		expect(tool.promptSnippet).toContain("Generate or edit PNG images");
+		expect(parameters.properties.model.description).toContain("imageGeneration.defaultModel");
+		expect(parameters.properties.batchSize.anyOf.map((schema: { type: string }) => schema.type)).toEqual([
+			"null",
+			"integer",
+		]);
+		expect(parameters.properties.batchSize.description).toContain("independent image requests");
+		expect(tool.promptSnippet).toContain("independent Images API request");
 		expect(tool.promptGuidelines.some((guideline: string) => guideline.includes("never invent paths"))).toBe(true);
 		expect(tool.promptGuidelines.some((guideline: string) => guideline.includes("never invent a destination"))).toBe(true);
 		expect(
 			tool.promptGuidelines.some((guideline: string) => guideline.includes("never invent or guess a model id")),
+		).toBe(true);
+		expect(
+			tool.promptGuidelines.some((guideline: string) => guideline.includes("each batch item is an independent paid request")),
 		).toBe(true);
 	});
 

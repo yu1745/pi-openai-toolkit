@@ -3,7 +3,6 @@ import {
 	codexContextProviderHeaders,
 	resolveCodexContextProvider,
 } from "./codex-provider";
-import { executeLocalHistory, executeLocalNotes } from "./local-backend";
 import {
 	isRecord,
 	type HistoryAction,
@@ -38,6 +37,11 @@ export const NOTES_ENDPOINTS = {
 	write_file: "alpha/notes/v2/write_file",
 } as const satisfies Record<NotesAction, string>;
 
+const NOTES_WRITE_ENDPOINTS = new Set<string>([
+	NOTES_ENDPOINTS.append_to_file,
+	NOTES_ENDPOINTS.write_file,
+]);
+
 export const ENCRYPTED_ARGUMENT_ENDPOINTS = new Set<string>([
 	HISTORY_ENDPOINTS.search_contents,
 	NOTES_ENDPOINTS.search_contents,
@@ -67,9 +71,29 @@ export const NOTES_ACTION_FIELDS: Record<NotesAction, readonly string[]> = {
 };
 
 export interface CodexHistoryNotesDetails {
-	/** Generic success marker; codexHistoryNotes is retained for persisted remote sessions. */
-	contextManagement: Record<string, unknown>;
-	codexHistoryNotes?: Record<string, unknown>;
+	codexHistoryNotes: Record<string, unknown>;
+}
+
+/**
+ * Optional backend status flags are accepted only when explicitly affirmative;
+ * an omitted flag is compatible with older response shapes.
+ */
+export function isSuccessfulHistoryNotesResponse(value: unknown): value is HistoryNotesResponse {
+	return isRecord(value) && isAffirmativeOptionalBoolean(value.ok) && isAffirmativeOptionalBoolean(value.success);
+}
+
+/** Validate persisted tool-result details before using them as a checkpoint. */
+export function isSuccessfulHistoryNotesToolResult(details: unknown): details is CodexHistoryNotesDetails {
+	if (!isRecord(details) || !isRecord(details.codexHistoryNotes)) return false;
+	return isSuccessfulHistoryNotesResponse(details.codexHistoryNotes);
+}
+
+function isAffirmativeOptionalBoolean(value: unknown): boolean {
+	return value === undefined || value === true;
+}
+
+function isRejectedNotesWriteResponse(value: HistoryNotesResponse): boolean {
+	return value.ok === false || value.success === false;
 }
 
 export async function callHistoryNotesBackend(
@@ -175,6 +199,7 @@ export async function loadHistoryNotesThreadHint(
 		if (result.reason === "aborted") throw new Error("Remote context hint request was aborted");
 		return undefined;
 	}
+	if (!isSuccessfulHistoryNotesResponse(result.value)) return undefined;
 	const text = result.value.text;
 	return typeof text === "string" && Buffer.byteLength(text, "utf8") <= THREAD_HINT_MAX_BYTES ? text : undefined;
 }
@@ -186,25 +211,25 @@ export async function executeHistoryNotesTool(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 	gatewayModels: readonly string[] = [],
-	backend: "remote" | "local" = "local",
 ): Promise<AgentToolResult<CodexHistoryNotesDetails>> {
 	const endpoint = namespace === "history"
 		? HISTORY_ENDPOINTS[action as HistoryAction]
 		: NOTES_ENDPOINTS[action as NotesAction];
 	if (!endpoint) throw new Error(`Unsupported ${namespace} action`);
 	validateAction(namespace, action, params);
-	let value: Record<string, unknown>;
-	if (backend === "local") {
-		if (signal?.aborted) throw new Error("Local history/notes request was aborted");
-		value = namespace === "history"
-			? await executeLocalHistory(action as HistoryAction, stripAction(params), ctx)
-			: await executeLocalNotes(action as NotesAction, stripAction(params), ctx, signal);
-	} else {
-		const result = await callHistoryNotesBackend(endpoint, stripAction(params), ctx, signal, undefined, gatewayModels);
-		if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));
-		value = result.value;
+	const result = await callHistoryNotesBackend(
+		endpoint,
+		stripAction(params),
+		ctx,
+		signal,
+		undefined,
+		gatewayModels,
+	);
+	if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));
+	if (NOTES_WRITE_ENDPOINTS.has(endpoint) && isRejectedNotesWriteResponse(result.value)) {
+		throw new Error("Remote notes write was rejected");
 	}
-	const modelResult = { ...value };
+	const modelResult = { ...result.value };
 	delete modelResult.images;
 	const content: AgentToolResult<CodexHistoryNotesDetails>["content"] = [
 		{
@@ -214,13 +239,8 @@ export async function executeHistoryNotesTool(
 				: JSON.stringify(modelResult),
 		},
 	];
-	for (const image of parseBackendImages(value.images)) content.push(image);
-	return {
-		content,
-		details: backend === "remote"
-			? { contextManagement: modelResult, codexHistoryNotes: modelResult }
-			: { contextManagement: modelResult },
-	};
+	for (const image of parseBackendImages(result.value.images)) content.push(image);
+	return { content, details: { codexHistoryNotes: modelResult } };
 }
 
 export function formatHistoryNotesFailure(
@@ -238,6 +258,7 @@ export function formatHistoryNotesFailure(
 		case "missing-api-key": return "Remote history/notes gateway authentication is missing an API key";
 		case "missing-account-id": return "Remote history/notes authentication is missing an account id";
 		case "missing-base-url": return "Remote history/notes backend is missing a base URL";
+		case "missing-session-id": return "Remote history/notes request is missing a session id";
 		case "unsupported-backend": return "Remote history/notes require the native Codex backend";
 		case "protocol-error": return "Remote history/notes request failed";
 		case "invalid-account-token": return "Remote history/notes authentication token is invalid";
@@ -295,7 +316,7 @@ function parseBackendImages(value: unknown): Array<{
 	detail?: "auto" | "high" | "original";
 }> {
 	if (value === undefined) return [];
-	if (!isValidImages(value)) throw new Error("History/notes backend returned invalid image content");
+	if (!isValidImages(value)) throw new Error("Remote history backend returned invalid image content");
 	return value.map((item) => ({
 		type: "image" as const,
 		data: item.data,

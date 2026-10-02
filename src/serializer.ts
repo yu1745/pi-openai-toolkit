@@ -89,6 +89,21 @@ export type ResponsesFunctionCallOutputItem = {
 
 export type ResponsesReasoningItem = Record<string, unknown>;
 
+/**
+ * Pi 0.86 adds `SystemMessage` to the public `Message` union; 0.85.1 has no system
+ * variant and does not export that type name. Use the public shape when the installed
+ * Pi declares it and a structural fallback for the fields this serializer consumes
+ * otherwise, so one source file type-checks against both supported versions.
+ */
+type ResponsesSystemMessage = Extract<Message, { role: "system" }> extends never
+	? {
+			role: "system";
+			content: string | TextContent[];
+			sections?: Record<string, string | null>;
+			timestamp: number;
+		}
+	: Extract<Message, { role: "system" }>;
+
 export type ResponsesInputItem =
 	| ResponsesInputMessageItem
 	| ResponsesAssistantOutputItem
@@ -106,6 +121,8 @@ export type NativeCompactionRequestBody = CompactionRequestExtras & {
 export type SerializeResponsesMessagesOptions = {
 	instructions?: string;
 	includeInstructionsInInput?: boolean;
+	/** Treat a system message at the start of a sliced post-compaction tail as an update. */
+	firstSystemMessageIsUpdate?: boolean;
 };
 
 export type ResponsesParityReport = {
@@ -124,6 +141,13 @@ const SYNTHETIC_TOOL_RESULT_TEXT = "No result provided";
 
 function sanitizeSurrogates(text: string): string {
 	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+}
+
+function instructionRole<TApi extends Api>(model: Model<TApi>): "developer" | "system" {
+	// Pi's public Model compat union is broader than the OpenAI Responses compat
+	// shape, while the runtime field is shared by both supported Pi versions.
+	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
+	return model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
 }
 
 export function collectCompactionWindowMessages(preparation: CompactionPreparation): AgentMessage[] {
@@ -154,24 +178,83 @@ export function serializeMessagesToCompactRequest<TApi extends Api>(args: {
 	};
 }
 
+/**
+ * Async compaction serializer used by live synthetic requests. Pi exposes model
+ * image limits and newer versions expose a public resize helper; keep the
+ * historical sync API for callers/tests while applying those limits only at the
+ * actual request edge.
+ */
+export async function serializeMessagesToCompactRequestWithLimits<TApi extends Api>(args: {
+	model: Model<TApi>;
+	messages: AgentMessage[];
+	instructions: string;
+}): Promise<NativeCompactionRequestBody> {
+	return {
+		model: args.model.id,
+		input: await serializeMessagesToResponsesInputWithLimits(args.model, args.messages),
+		instructions: sanitizeSurrogates(args.instructions),
+	};
+}
+
 export function serializeMessagesToResponsesInput<TApi extends Api>(
 	model: Model<TApi>,
 	messages: AgentMessage[],
 	options: SerializeResponsesMessagesOptions = {},
 ): ResponsesInputItem[] {
-	const llmMessages = convertToLlm(messages);
-	const transformedMessages = transformMessagesForResponses(llmMessages);
+	return serializeLlmMessagesToResponsesInput(model, convertToLlm(messages), options);
+}
+
+export async function serializeMessagesToResponsesInputWithLimits<TApi extends Api>(
+	model: Model<TApi>,
+	messages: AgentMessage[],
+	options: SerializeResponsesMessagesOptions = {},
+): Promise<ResponsesInputItem[]> {
+	return applyModelImageInputLimits(
+		model,
+		serializeMessagesToResponsesInput(model, messages, options),
+	);
+}
+
+export async function serializeLlmMessagesToResponsesInputWithLimits<TApi extends Api>(
+	model: Model<TApi>,
+	messages: Message[],
+	options: SerializeResponsesMessagesOptions = {},
+): Promise<ResponsesInputItem[]> {
+	return applyModelImageInputLimits(
+		model,
+		serializeLlmMessagesToResponsesInput(model, messages, options),
+	);
+}
+
+/**
+ * Serialize Pi's normalized LLM message union without running `convertToLlm` again.
+ * This keeps the system-message boundary directly testable while preserving the public
+ * AgentMessage-facing entry point above.
+ */
+export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
+	model: Model<TApi>,
+	messages: Message[],
+	options: SerializeResponsesMessagesOptions = {},
+): ResponsesInputItem[] {
+	const transformedMessages = transformMessagesForResponses(messages);
 	const input: ResponsesInputItem[] = [];
 
 	if (options.includeInstructionsInInput && options.instructions) {
 		input.push({
-			role: model.reasoning ? "developer" : "system",
+			role: instructionRole(model),
 			content: sanitizeSurrogates(options.instructions),
 		});
 	}
 
 	let messageIndex = 0;
+	let sourceIndex = 0;
 	for (const message of transformedMessages) {
+		// Pi 0.85's Message union has no system member, so compare through the
+		// public role string while keeping the 0.86 discriminant runtime-compatible.
+		const isFirstMessage = sourceIndex++ === 0;
+		const isLeadingSystemMessage =
+			!options.firstSystemMessageIsUpdate && isFirstMessage && (message.role as string) === "system";
+
 		if (message.role === "user") {
 			const item = serializeUserMessage(message, model);
 			if (item) {
@@ -190,11 +273,198 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 			continue;
 		}
 
-		input.push(serializeToolResultMessage(message, model));
-		messageIndex++;
+		if (message.role === "toolResult") {
+			input.push(serializeToolResultMessage(message, model));
+			messageIndex++;
+			continue;
+		}
+
+		// In Pi 0.85.1 this branch narrows to `never`; in Pi 0.86 it is a SystemMessage.
+		// Handle it explicitly instead of letting a new message variant become tool output.
+		const systemItem = serializeSystemMessage(message, model, isLeadingSystemMessage);
+		if (systemItem) {
+			input.push(systemItem);
+		}
+		if (!isLeadingSystemMessage) {
+			messageIndex++;
+		}
 	}
 
 	return input;
+}
+
+type ImageResizeOptions = {
+	maxWidth?: number;
+	maxHeight?: number;
+	maxBytes?: number;
+	jpegQuality?: number;
+};
+
+type ModelImageInputLimits = {
+	resize?: ImageResizeOptions;
+	maxPerMessage?: number;
+	maxPerRequest?: number;
+};
+
+type ResizeImageResult = {
+	data: string;
+	mimeType: string;
+};
+
+type ResizeImageFunction = (
+	inputBytes: Uint8Array,
+	mimeType: string,
+	options?: ImageResizeOptions,
+) => Promise<ResizeImageResult | null>;
+
+let resizeImageLoader: Promise<ResizeImageFunction | undefined> | undefined;
+
+function getModelImageInputLimits(model: Model<Api>): ModelImageInputLimits | undefined {
+	return (model as Model<Api> & { inputLimits?: { images?: ModelImageInputLimits } }).inputLimits?.images;
+}
+
+function readNonNegativeLimit(value: unknown, name: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`Model image input limit ${name} is invalid.`);
+	}
+	return value;
+}
+
+function normalizeResizeOptions(value: unknown): ImageResizeOptions | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Record<string, unknown>;
+	const options: ImageResizeOptions = {};
+	for (const key of ["maxWidth", "maxHeight", "maxBytes"] as const) {
+		const number = candidate[key];
+		if (number === undefined) continue;
+		if (typeof number !== "number" || !Number.isFinite(number) || number <= 0) {
+			throw new Error(`Model image resize option ${key} is invalid.`);
+		}
+		options[key] = Math.floor(number);
+	}
+	if (candidate.jpegQuality !== undefined) {
+		if (
+			typeof candidate.jpegQuality !== "number" ||
+			!Number.isFinite(candidate.jpegQuality) ||
+			candidate.jpegQuality <= 0 ||
+			candidate.jpegQuality > 100
+		) {
+			throw new Error("Model image resize option jpegQuality is invalid.");
+		}
+		options.jpegQuality = candidate.jpegQuality;
+	}
+	return Object.keys(options).length > 0 ? options : undefined;
+}
+
+async function loadResizeImage(): Promise<ResizeImageFunction | undefined> {
+	resizeImageLoader ??= (async () => {
+		try {
+			const module = await import("@earendil-works/pi-coding-agent") as {
+				resizeImage?: ResizeImageFunction;
+			};
+			return typeof module.resizeImage === "function" ? module.resizeImage : undefined;
+		} catch {
+			// Pi 0.87 does not export the helper. The request must fail closed when
+			// a newer model explicitly requires a resize rather than sending a
+			// potentially oversized image unchanged.
+			return undefined;
+		}
+	})();
+	return resizeImageLoader;
+}
+
+function inputContentArray(item: ResponsesInputItem): ResponsesInputContentItem[] | undefined {
+	if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+	const candidate = item as Record<string, unknown>;
+	if (candidate.type === "function_call_output") {
+		return Array.isArray(candidate.output) ? candidate.output as ResponsesInputContentItem[] : undefined;
+	}
+	return Array.isArray(candidate.content) ? candidate.content as ResponsesInputContentItem[] : undefined;
+}
+
+function isInputImage(item: ResponsesInputContentItem): item is ResponsesImageInputItem {
+	return item.type === "input_image";
+}
+
+function decodeDataImage(imageUrl: string): { mimeType: string; bytes: Uint8Array } {
+	const separator = imageUrl.indexOf(",");
+	const prefix = separator >= 0 ? imageUrl.slice(0, separator) : "";
+	if (!prefix.startsWith("data:") || !prefix.endsWith(";base64") || separator < 0) {
+		throw new Error("Model image input has an invalid data URL.");
+	}
+	const mimeType = prefix.slice("data:".length, -";base64".length);
+	if (!mimeType) throw new Error("Model image input has no MIME type.");
+	return { mimeType, bytes: Buffer.from(imageUrl.slice(separator + 1), "base64") };
+}
+
+async function resizeInputImage(
+	image: ResponsesImageInputItem,
+	options: ImageResizeOptions,
+): Promise<ResponsesImageInputItem> {
+	const resizeImage = await loadResizeImage();
+	if (!resizeImage) {
+		throw new Error("The active Pi version cannot resize an image required by model input limits.");
+	}
+	const source = decodeDataImage(image.image_url);
+	const resized = await resizeImage(source.bytes, source.mimeType, options);
+	if (!resized || typeof resized.data !== "string" || typeof resized.mimeType !== "string") {
+		throw new Error("Model image input could not be resized within the provider limits.");
+	}
+	return {
+		...image,
+		image_url: `data:${resized.mimeType};base64,${resized.data}`,
+	};
+}
+
+/** Enforce Pi's per-message/request image limits without mutating serialized input. */
+export async function applyModelImageInputLimits<TApi extends Api>(
+	model: Model<TApi>,
+	input: ResponsesInputItem[],
+): Promise<ResponsesInputItem[]> {
+	const limits = getModelImageInputLimits(model);
+	if (!limits) return input;
+
+	const maxPerMessage = readNonNegativeLimit(limits.maxPerMessage, "maxPerMessage");
+	const maxPerRequest = readNonNegativeLimit(limits.maxPerRequest, "maxPerRequest");
+	const resizeOptions = normalizeResizeOptions(limits.resize);
+	let requestImageCount = 0;
+	const output: ResponsesInputItem[] = [];
+
+	for (const item of input) {
+		const content = inputContentArray(item);
+		if (!content) {
+			output.push(item);
+			continue;
+		}
+		const imageCount = content.filter(isInputImage).length;
+		if (maxPerMessage !== undefined && imageCount > maxPerMessage) {
+			throw new Error(`Model accepts at most ${maxPerMessage} image(s) per message.`);
+		}
+		if (maxPerRequest !== undefined && requestImageCount + imageCount > maxPerRequest) {
+			throw new Error(`Model accepts at most ${maxPerRequest} image(s) per request.`);
+		}
+		requestImageCount += imageCount;
+
+		if (!resizeOptions || imageCount === 0) {
+			output.push(item);
+			continue;
+		}
+		const resizedContent: ResponsesInputContentItem[] = [];
+		for (const contentItem of content) {
+			resizedContent.push(isInputImage(contentItem)
+				? await resizeInputImage(contentItem, resizeOptions)
+				: contentItem);
+		}
+		const itemRecord = item as Record<string, unknown>;
+		if (itemRecord.type === "function_call_output") {
+			output.push({ ...item, output: resizedContent } as ResponsesInputItem);
+		} else {
+			output.push({ ...item, content: resizedContent } as ResponsesInputItem);
+		}
+	}
+
+	return output;
 }
 
 export function createResponsesInputParitySignature(input: readonly unknown[]): string[] {
@@ -444,6 +714,72 @@ function serializeToolResultMessage<TApi extends Api>(
 
 function normalizeUserContent(content: UserMessage["content"]): Array<TextContent | ImageContent> {
 	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/**
+ * Serialize one normalized Pi system message as a Responses input message.
+ *
+ * The role follows the same reasoning-model convention as `instructions`: reasoning
+ * models use `developer`, everything else keeps `system`. Leading messages include
+ * their complete section state; later messages use Pi's update framing so section
+ * additions/removals are not mistaken for a new complete prompt. An empty system
+ * message produces no item, matching Pi.
+ */
+function serializeSystemMessage<TApi extends Api>(
+	message: ResponsesSystemMessage,
+	model: Model<TApi>,
+	isLeadingSystemMessage: boolean,
+): ResponsesInputMessageItem | undefined {
+	const text = sanitizeSurrogates(
+		isLeadingSystemMessage ? getSystemMessageText(message) : renderSystemMessageUpdate(message),
+	);
+	if (text.length === 0) {
+		return undefined;
+	}
+
+	return {
+		role: instructionRole(model),
+		content: text,
+	};
+}
+
+/** Mirrors Pi's public getSystemMessageText() without importing a 0.86-only helper. */
+function getSystemMessageText(message: ResponsesSystemMessage): string {
+	const parts = [contentText(message.content)];
+	for (const text of Object.values(message.sections ?? {})) {
+		if (text !== null) {
+			parts.push(text);
+		}
+	}
+	return parts.filter((part) => part.length > 0).join("\n\n");
+}
+
+/** Mirrors Pi's public renderSystemMessageUpdate() for later transcript updates. */
+function renderSystemMessageUpdate(message: ResponsesSystemMessage): string {
+	const parts: string[] = [];
+	const text = contentText(message.content);
+	if (text.length > 0) {
+		parts.push(text);
+	}
+	for (const [name, value] of Object.entries(message.sections ?? {})) {
+		parts.push(
+			value === null
+				? `Removed system prompt section "${name}".`
+				: `Updated system prompt section "${name}":\n\n${value}`,
+		);
+	}
+	return parts.join("\n\n");
+}
+
+function contentText(content: ResponsesSystemMessage["content"]): string {
+	if (typeof content === "string") {
+		return content;
+	}
+
+	return content
+		.filter((item): item is TextContent => item.type === "text")
+		.map((item) => item.text)
+		.join("\n");
 }
 
 function parseReasoningItem(block: ThinkingContent): ResponsesReasoningItem | undefined {

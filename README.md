@@ -1,225 +1,156 @@
 # pi-openai-toolkit
 
-Add local context windows, Responses compaction, hosted tools, and reviewed tool calls to Pi.
+Remote context windows, Responses compaction, web search, image generation, and tool-call review for Pi. Uses Pi's existing models, endpoints, authentication, and sessions without registering another provider or model.
 
 [![npm version](https://img.shields.io/npm/v/pi-openai-toolkit.svg)](https://www.npmjs.com/package/pi-openai-toolkit)
-[![License: MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
+[![MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
 
 [简体中文](README.zh.md)
 
-## Features
+## Install and start
 
-| Feature | Use it to |
-| --- | --- |
-| Local Context Management | Start a new context window and retrieve earlier windows with local `history` and `notes`. |
-| Remote Compaction v2 | Continue an eligible Responses session with an encrypted server checkpoint. |
-| Hosted Web Search | Give selected models OpenAI's hosted search tool. |
-| Image generation | Generate images or edit explicitly supplied local reference images. |
-| Tool-call review | Ask a reviewer model whether selected tool calls may run. |
-
-The package uses Pi's existing model, authentication, and session configuration. It does not add a provider or model.
-
-## Install
-
-Requires Pi 0.85.1 or newer and Node.js 22.19.0 or newer.
-
-Install the extension:
+Requires Node.js **22.19.0+** and Pi **0.87.0+**. Current development dependencies pin Pi **0.99.1**; backend features also depend on the selected model, API, and account access.
 
 ```bash
 pi install npm:pi-openai-toolkit
 ```
 
-Use `--local` to install it in the current project.
+Configure your model and credentials in Pi, then start Pi normally. Without a Toolkit config file, eligible models use remote compaction by default. Search remains managed by Pi and other extensions; image generation and Auto Mode are off.
 
-Installing the package alone does not enable every feature. With no extension config, compaction is enabled but local Context Management is off, the Web Search model list is empty, image generation is disabled, and Auto Mode has no allowed models or reviewer.
+Toolkit reads one global configuration file, even for a project-local installation:
 
-The extension config file is:
+```text
+~/.pi/agent/extensions/pi-openai-toolkit/config.json
+```
 
-`~/.pi/agent/extensions/pi-openai-toolkit/config.json`
-
-All JSON configuration examples below, except the `models.json` example, go in this file. If it does not exist, create the file and its parent directory. If it already exists, merge fields into the matching objects and keep the other settings.
-
-## Quick start: enable Context Management
-
-This section is for users who want Codex-style context windows. If you only want Web Search, image generation, or tool-call review, skip to [Common tasks](#common-tasks).
-
-### Use any configured Pi model
-
-Context Management uses hybrid routing. Allowlisted native `openai-codex` models use hosted history/notes and no-summary rolling windows; other providers use the local backend. Native Codex models outside the rolling-window allowlist keep Context Management off and use the independent Remote Compaction v2 path. Normal model inference always uses the provider authentication configured in Pi.
-
-Create or merge this extension config:
+Create the parent directory if needed. New configurations use schema v2:
 
 ```json
 {
-  "compaction": {
-    "contextManagement": "auto"
+  "schemaVersion": 2,
+  "defaults": {
+    "context": { "mode": "remote-compaction" }
   }
 }
 ```
 
-Start Pi with any model already configured in Pi, for example:
+Check the configuration from Pi:
 
-```bash
-pi --model openai-codex/<model-id>
-```
+- `/toolkit-config`: show effective values and their sources
+- `/toolkit-config validate`: check configuration errors
+- `/toolkit-config migration-preview`: preview a legacy migration without writing files
 
-The session is activated when `new_context`, `get_context_remaining`, `history`, and `notes` appear as available tools. With `contextManagement: "auto"`, non-Codex providers use the local backend: no Codex alpha history/notes request, hosted context header, or encrypted tool-output rewrite is used. Local notes and history are scoped to a **root task/session**, then namespaced by agent, not shared across every conversation in a project. Explicitly associated child agents share that task even across working directories or worktrees. The default agent is `/root`; the SDK host must supply child identity rather than inferring it from project paths, display names, or `parentSession`. See [local context parity](docs/context-management-parity.md).
+Settings resolve in this order: built-in defaults → `defaults` → `models["provider/model-id"]`. Model keys are exact and case-sensitive; wildcards and project-level policy are not supported. Merge the examples below into your existing file without replacing unrelated settings. For an unversioned configuration, read the [migration guide](docs/configuration.md#legacy-compatibility-and-migration) first.
 
-The hosted rolling-window allowlist is read without modification from `~/.pi/agent/settings.json` at `openaiToolkit.codexContextModels`. Its defaults are `openai-codex/gpt-6-astra` and `openai-codex/gpt-5.6-sol`. Only allowlisted native Codex models receive the hosted transport; an unlisted native Codex model deliberately receives no context-management tools or window ownership.
+## Context management
 
-### Use another provider or gateway
+Set `defaults.context.mode` or an individual model's `context.mode`:
 
-If `~/.pi/agent/models.json` already contains the model, skip model configuration. Otherwise, add or merge the provider entry below. Replace `my-gateway`, the URL, the environment variable name, and the model values with values from your setup. The numeric values shown are examples, not project defaults; they must match the actual model and gateway.
+- `remote-compaction`: the default; continue with encrypted checkpoints returned by the server
+- `remote-windows`: use Codex remote context windows, retrieve earlier work with `history`, and save handoff notes with `notes`
+- `pi`: leave context management to Pi
+
+**Remote compaction** accepts the `openai-responses`, `openai-codex-responses`, and `azure-openai-responses` API types. The backend must still support the checkpoint protocol. Set `context.remoteCompaction.model` to use a separate compaction model; remote compaction requires the same effective base URL as the active model. Native summary fallback has separate settings and does not apply to every failure: empty checkpoints, incompatible provenance, or edits to sealed history block storage or replay. See [context settings](docs/configuration.md#context) and [checkpoint rules](docs/internals.md#remote-compaction-v2-wire-contract).
+
+**Remote windows** require the native `openai-codex` provider with `openai-codex-responses`, or an `openai-responses` gateway implementing the protocol. Gateways require `compatibility.transport: "codex-gateway"` on the exact model entry. This setting does not add the capability to an ordinary compatible endpoint.
+
+Change `mode` in the example above to `remote-windows`. Eligible sessions expose `new_context`, `get_context_remaining`, `history`, and `notes`. Manual `/compact [instructions]` starts a checkpoint handoff: write notes successfully, then switch windows. Models without window capability retain the compaction flow; a failed window activation does not silently switch to a summary.
+
+Remote windows use alpha endpoints that may change upstream. When switching models, also watch for retired-window history that has not yet been trimmed. See the [window lifecycle](docs/internals.md#rollover-lifecycle).
+
+## Search, images, and tool review
+
+### Web search
+
+Set `defaults.webSearch.route` or an exact model's `webSearch.route`:
+
+- `unmanaged`: the default; leave search ownership alone. This does not disable network access
+- `local`: retain existing local search tools, such as `pi-web-access`; do not install or activate previously inactive tools
+- `hosted`: use Responses `web_search` with source annotations and suppress conflicting local search tools
+- `standalone-alpha`: experimental `web_run`, using a separate `/alpha/search` request for searches, page opening, and related operations
+
+`hosted` accepts the three Responses API types listed above, subject to backend support and account access. `standalone-alpha` is restricted to verified OpenAI/Codex routes; a gateway must expose the endpoint and capability. An unavailable route, missing authentication, or a tool conflict never causes an automatic switch to another route. See [search configuration](docs/configuration.md#web-search) for supported operations.
+
+### Image generation
+
+Image settings belong only under global `defaults.imageGeneration`. Replace `image-model-id` with an image model your backend supports:
 
 ```json
 {
-  "providers": {
-    "my-gateway": {
-      "baseUrl": "https://your-gateway.example/v1",
-      "api": "openai-responses",
-      "apiKey": "$MY_GATEWAY_KEY",
-      "models": [{
-        "id": "gpt-5.6-luna",
-        "name": "GPT-5.6 Luna",
-        "reasoning": true,
-        "input": ["text"],
-        "contextWindow": 272000,
-        "maxTokens": 128000
-      }]
+  "schemaVersion": 2,
+  "defaults": {
+    "imageGeneration": {
+      "enabled": true,
+      "defaultModel": "image-model-id",
+      "allowedModels": ["image-model-id"]
     }
   }
 }
 ```
 
-Set the referenced key before starting Pi. In PowerShell:
+Eligible sessions expose `openai_generate_image` for generation, reference-image editing, and batches. The conversation model supplies routing and authentication; the image model is called through a separate Images API without replacing the conversation model. The built-in image default is `grok-imagine-image-2.0`, which your backend may not support. `defaultModel` must be included in `allowedModels`.
 
-```powershell
-$env:MY_GATEWAY_KEY = "replace-with-your-gateway-key"
-```
+Requires an `openai-responses` or `openai-codex-responses` route and a working Images API. Responses must contain base64-encoded PNG, JPEG, or WebP output. `batchSize` accepts 1–10; each image is a separate request and may incur a separate charge. Partial failure preserves images already saved. Editing sends reference images to the provider, so make sure those images can be uploaded. See [image configuration](docs/configuration.md#images).
 
-In a POSIX shell:
+### Responses WebSocket transport
 
-```bash
-export MY_GATEWAY_KEY="replace-with-your-gateway-key"
-```
-
-Use the same terminal session to start Pi. Create or merge the extension config:
+The Toolkit WebSocket adapter is disabled by default. Enable it globally for GPT models that use Pi's `openai-responses` API:
 
 ```json
 {
-  "compaction": {
-    "contextManagement": "auto"
+  "schemaVersion": 2,
+  "defaults": {
+    "responsesWebSocket": { "enabled": true }
   }
 }
 ```
 
-Start Pi with the same model specification:
+It reuses the selected model's provider, base URL, credentials, headers, and model ID without registering another provider. Pi's `transport: "auto"` tries WebSocket first and falls back to SSE before streaming starts; with a stable session it also reuses the socket and sends only the new continuation input when the transcript matches. Use `transport: "websocket-cached"` to require that cached path, or `transport: "sse"` to keep the original HTTP/SSE path. Restart or reload Pi after changing the Toolkit setting. See [WebSocket configuration](docs/configuration.md#responses-websocket-transport).
 
-```bash
-pi --model my-gateway/gpt-5.6-luna
-```
+### Auto Mode
 
-The enablement check is the same: the session should expose `new_context`, `get_context_remaining`, `history`, and `notes`. If they do not appear, read the toolkit notification and check the extension configuration and tool-name conflicts.
-
-Earlier windows remain available through `history`, but they are not all automatically added to the current context.
-
-## Common tasks
-
-### Continue a session with server-side compaction
-
-Set Context Management to `"off"` when you want the Responses compaction path instead. Unallowlisted native Codex models also use this independent Remote Compaction v2 path while `contextManagement` is `"auto"`; they do not receive no-summary rolling windows. Remote Compaction v2 stores and replays an encrypted checkpoint for eligible Responses models. Set `compaction.remoteCompactModel` only when the compaction request should use a separate model.
-
-### Enable hosted Web Search
-
-List exact model specifications under `webSearch.models`:
+Auto Mode uses model-based review before tool execution. Permit it and select a reviewer registered and authenticated in Pi, then engage it explicitly:
 
 ```json
 {
-  "webSearch": {
-    "models": ["my-gateway/gpt-5.6-luna"]
+  "schemaVersion": 2,
+  "defaults": {
+    "autoMode": {
+      "available": true,
+      "reviewerModel": "provider/reviewer-model-id"
+    }
   }
 }
 ```
 
-For those models, the extension replaces Pi's local `web_search` tool with OpenAI's hosted Responses search tool.
+Replace `provider/reviewer-model-id` with a real model reference. Use `/auto on` or the `--auto` startup flag to engage, and `/auto off` to disengage. Setting `available: true` alone does not engage the gate.
 
-### Generate an image
+The default `gate: "side-effect"` reviews `bash`, `write`, `edit`, and `extraTools`. Use `gate: "all"` to cover every tool. Read-only evidence gathering, denial circuit breakers, and optional background classifier pre-scoring are supported. With the classifier enabled, some calls can pass based on a pre-score.
 
-Image generation requires a Responses session and may incur provider charges. Enable it with:
+A timeout or unavailable review is never approval: interactive sessions ask for confirmation, while headless sessions block the call. This is not a sandbox or a guarantee of correct decisions. Selecting an ineligible model disengages Auto Mode. See [Auto Mode settings](docs/configuration.md#auto-mode).
 
-```json
-{
-  "imageGeneration": {
-    "enabled": true,
-    "models": ["gpt-image-2.5", "grok-imagine-image-2.0"]
-  }
-}
-```
+## Compatibility and troubleshooting
 
-`models` contains the bare model IDs used by the nested Responses `image_generation` tool. The first entry is the default; `openai_generate_image` also accepts an optional `model` argument for a one-call override, but it must match a configured entry exactly. If `models` is omitted, the default is `gpt-image-2.5`. Empty or invalid lists are ignored with a warning and fall back to that default; set `enabled` to `false` to disable the tool. The provider or gateway must support the configured image model.
+- Keep providers, endpoints, and credentials in Pi, not Toolkit configuration. See [provider setup](docs/configuration.md#provider-specific-responses-endpoints) for Azure deployment mapping, `api-version`, and authentication
+- `pi-virtual` capability checks use the physical provider/model resolved by Pi, without inferring support from the virtual model's name
+- Compaction and replay honor `inputLimits.images` resizing and count limits from Pi model metadata without changing the persisted session or original request object
+- Invalid settings block dependent operations. Run `/toolkit-config validate`, then check the model, authentication, and backend capabilities. Valid configuration is not a successful endpoint test
+- Request and compact-response capture are off by default. Enable `diagnostics.captureRequests` / `captureResponses` only for troubleshooting, and check logs for conversation content before sharing
 
-The `openai_generate_image` tool supports text-to-image requests and edits using explicitly supplied local reference images.
-
-### Review tool calls automatically
-
-Allow a model and reviewer in `autoMode`:
-
-```json
-{
-  "autoMode": {
-    "models": ["my-gateway/gpt-5.6-luna"],
-    "reviewerModel": "my-gateway/gpt-5.6-luna"
-  }
-}
-```
-
-Use `/auto on` in the session. The default `side-effect` gate reviews `bash`, `write`, `edit`, and configured extra tools. Set `gate` to `"all"` when every tool call needs review. A reviewer timeout does not approve a call.
-
-## Common configuration
-
-The config file is `~/.pi/agent/extensions/pi-openai-toolkit/config.json`. Unknown keys are ignored with a warning. Most model lists use exact `provider/model-id` strings, not globs; `imageGeneration.models` is an exception and contains bare nested image-generation model IDs.
-
-| Key | Default | Use |
-| --- | --- | --- |
-| `compaction.enabled` | `true` | Master switch for compaction. |
-| `compaction.contextManagement` | `"off"` | `"auto"` routes allowlisted native `openai-codex` models to hosted rolling windows, non-Codex providers to local history/notes and windows, and unallowlisted native Codex models to independent Remote Compaction v2. Unknown values fail closed. |
-| `compaction.gatewayContextModels` | `openai-codex/gpt-6-astra`, `openai-codex/gpt-5.6-sol` | Hosted native-Codex rolling-window allowlist; synchronized from `settings.json` `openaiToolkit.codexContextModels` when present. |
-| `compaction.remoteCompactModel` | unset | Optional model used only for a v2 compaction request. |
-| `compaction.contextReminderThresholdPercent` | `5` | Remaining budget percentage for the once-per-window reminder. `0` disables the reminder and exhausted-window fallback. |
-| `webSearch.models` | `[]` | Models that receive hosted Web Search. |
-| `imageGeneration.enabled` | `false` | Enables `openai_generate_image`. |
-| `imageGeneration.models` | `["gpt-image-2.5"]` | Bare image-generation model IDs; the first entry is the default. |
-| `autoMode.models` | `[]` | Models allowed to use Auto Mode. |
-| `autoMode.reviewerModel` | unset | Model that reviews Auto Mode calls. |
-| `autoMode.gate` | `"side-effect"` | Use `"all"` to review every tool call. |
-| `autoMode.timeoutMs` | `30000` | Review timeout in milliseconds. |
-
-## Local storage and context diagnostics
-
-Local Context storage lives below `~/.pi/agent/extensions/pi-openai-toolkit/context-management/`:
-
-- `sessions/<root-session-key>/agents/root/notes/` contains root-agent notes; children use `agents/root/<agent-id>/notes/`. `<root-session-key>` is the SHA-256 of the root Pi session ID, independent of project paths.
-- Relative `state.md` addresses the current agent. Absolute virtual `/root/<agent-id>/notes/state.md` can read or write another agent within the same root session. Omitted list/search prefixes select only the current agent's notes.
-- `sessions/<root-session-key>/sources/` registers exact session sources; `history.sqlite` indexes them. Persisted Pi JSONL is the rebuildable source of truth; no project-wide or global session scan occurs. Live SDK in-memory sessions are readable and receive a best-effort final index snapshot on shutdown, but their history is not guaranteed to survive index rebuilding.
-- Every history action, including `read_item`, defaults to the current agent. `agent_name` can be absolute or relative to the caller. `search_contents` is case-sensitive literal substring matching.
-- Legacy `notes/<project-key>/` and `history/<project-key>.sqlite` are **left untouched: not read, migrated, or deleted automatically**. Copy old notes only after choosing and verifying the destination task. Ordinary `/new` and `/fork` create separate scopes; resuming the same session preserves its scope.
-- `status/<project-key>/<session-key>/latest.json` is the best-effort, atomically replaced status for one session. It is bounded to 16 KiB, its file mode is `0600` (directory `0700`), and it does not grow once per turn.
-
-Diagnostic project identity still hashes the Git common directory (canonical cwd on probe failure), but no longer defines Notes/History scope. The status reports the selected backend and activation, hashed project identity kind/key, window id/number and initialization/restoration, remaining budget and configured reminder threshold, reminder/fallback state, successful Notes checkpoint size when available, rollover outcome, and restoration state. `get_context_remaining` keeps its existing first sentence and token fields and also returns this status in `details.status`.
-
-Status collection is local-only and never includes Notes text, prompts, credentials, encrypted output, or cwd/session file paths. Writes are best-effort: an observer failure cannot block a request or context rollover. With `compaction.debug: true`, the same content-free status transitions are also written as detailed lifecycle artifacts; these lifecycle events do not include Notes or prompt bodies. Payload artifacts remain governed separately by the explicit payload logging options.
+See the [configuration reference](docs/configuration.md) and [JSON Schema](config.schema.json) for all fields and defaults. Protocol, checkpoint, and debugging details are in [internals](docs/internals.md).
 
 ## Development
 
-From the repository root, after dependencies are installed:
+From the repository root:
 
 ```bash
-npm run typecheck    # Type-check
-bun test             # Run tests
-npm run test:pi      # Run the Pi smoke test
-npm pack --dry-run   # Inspect the package contents
+npm ci
+npm run typecheck
+npm test
+npm run test:pi
+npm pack --dry-run
 ```
 
-## License
+Tests use Bun, included in the development dependencies. Keep JSON examples identical in both READMEs; the documentation tests check this.
 
-MIT © awoaCrim and contributors. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+MIT © awoaCrim and contributors. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party attribution.

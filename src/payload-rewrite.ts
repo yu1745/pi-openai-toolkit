@@ -1,16 +1,21 @@
-import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type {
-	BranchSummaryEntry,
-	CustomMessageEntry,
-	SessionEntry,
-	SessionMessageEntry,
-} from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
+import { hasVerifiedCompactionInputProvenance } from "./compaction-projection";
 import { rewritePayloadWithDeferredToolCarryover } from "./deferred-tool-carryover";
-import type { NativeCompactionEntry } from "./types";
-import { serializeMessagesToResponsesInput, type ResponsesInputContentItem, type ResponsesInputItem, type ResponsesInputMessageItem } from "./serializer";
+import type {
+	NativeCompactionEntry,
+	NativeCompactionInputProvenance,
+} from "./types";
+import {
+	serializeMessagesToResponsesInput,
+	serializeMessagesToResponsesInputWithLimits,
+	type ResponsesInputContentItem,
+	type ResponsesInputItem,
+	type ResponsesInputMessageItem,
+} from "./serializer";
 
 export type NativeReplaySegments = {
 	boundaryIndex: number;
@@ -35,7 +40,9 @@ export type NativeReplayPayloadRewriteFailureReason =
 	| "invalid-compacted-window"
 	| "unexpected-compaction-after-boundary"
 	| "compaction-summary-not-found"
-	| "retained-context-mismatch";
+	| "retained-context-mismatch"
+	| "unverified-compaction-input"
+	| "checkpoint-context-edited";
 
 export type NativeReplayPayloadRewriteFailure = {
 	ok: false;
@@ -195,46 +202,6 @@ function areEquivalentValues(left: unknown, right: unknown): boolean {
 	return false;
 }
 
-function toBranchSummaryMessage(entry: BranchSummaryEntry): AgentMessage {
-	return {
-		role: "branchSummary",
-		summary: entry.summary,
-		fromId: entry.fromId,
-		timestamp: new Date(entry.timestamp).getTime(),
-	} as AgentMessage;
-}
-
-function toCustomMessage(entry: CustomMessageEntry): AgentMessage {
-	return {
-		role: "custom",
-		customType: entry.customType,
-		content: entry.content,
-		display: entry.display,
-		details: entry.details,
-		timestamp: new Date(entry.timestamp).getTime(),
-	} as AgentMessage;
-}
-
-function toSessionMessage(entry: SessionMessageEntry): AgentMessage {
-	return entry.message;
-}
-
-function toReplayAgentMessage(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "message") {
-		return toSessionMessage(entry);
-	}
-
-	if (entry.type === "custom_message") {
-		return toCustomMessage(entry);
-	}
-
-	if (entry.type === "branch_summary") {
-		return toBranchSummaryMessage(entry);
-	}
-
-	return undefined;
-}
-
 function extractUserItemText(item: Record<string, unknown>): unknown {
 	const { content } = item;
 	if (typeof content === "string") {
@@ -268,23 +235,29 @@ function findCompactionSummaryIndex(input: readonly unknown[], summaryMarker: st
 }
 
 function collectReplayMessages(entries: readonly SessionEntry[]): AgentMessage[] {
-	const messages: AgentMessage[] = [];
-
-	for (const entry of entries) {
-		const message = toReplayAgentMessage(entry);
-		if (message) {
-			messages.push(message);
-		}
-	}
-
-	return messages;
+	return buildSessionProjection([...entries]).messages;
 }
 
-function findEntryIndexByIdBeforeBoundary(
+/** An opaque checkpoint cannot be selectively edited after it was produced. */
+export function hasInvalidatedCompactionContext(
+	entries: readonly SessionEntry[],
+	compactionEntryId: string,
+): boolean {
+	const boundary = findCompactionBoundaryIndex(entries, compactionEntryId);
+	if (boundary === undefined) return false;
+	const coveredIds = new Set(entries.slice(0, boundary).map((entry) => entry.id));
+	return entries.slice(boundary + 1).some((entry) =>
+		entry.type === "context_edit" && coveredIds.has(entry.targetId),
+	);
+}
+
+function findKeptEntryIndex(
 	entries: readonly SessionEntry[],
 	entryId: string,
 	boundaryIndex: number,
 ): number | undefined {
+	// Pi 0.87 uses the compaction itself as the retained boundary for retain-none.
+	if (entries[boundaryIndex]?.id === entryId) return boundaryIndex;
 	const index = entries.findIndex((entry, candidateIndex) => candidateIndex < boundaryIndex && entry.id === entryId);
 	return index >= 0 ? index : undefined;
 }
@@ -314,7 +287,7 @@ export function collectLiveTailMessages(entries: readonly SessionEntry[]): Agent
 }
 
 /**
- * Remote V2 covers the complete pre-compaction context. Pi 0.85.1 also retains
+ * Remote V2 covers the complete pre-compaction context. Pi also retains
  * recent messages, so remove those verified copies before provider conversion
  * (where IDs/fields may change across models). Persisted session entries are
  * untouched. Preserve transient additions and all post-compaction messages.
@@ -323,36 +296,92 @@ export function removeNativeCompactionRetainedMessages(args: {
 	messages: AgentMessage[];
 	branchEntries: readonly SessionEntry[];
 	compactionEntry: NativeCompactionEntry;
+	expectedInputProvenance: NativeCompactionInputProvenance;
 }): { ok: true; messages: AgentMessage[] } | NativeReplayPayloadRewriteFailure {
 	const boundary = findCompactionBoundaryIndex(args.branchEntries, args.compactionEntry.id);
 	if (boundary === undefined) return { ok: false, reason: "compaction-boundary-not-found" };
-	const firstKept = findEntryIndexByIdBeforeBoundary(args.branchEntries, args.compactionEntry.firstKeptEntryId, boundary);
+	if (!hasVerifiedCompactionInputProvenance(args.compactionEntry.details, args.expectedInputProvenance)) {
+		return { ok: false, reason: "unverified-compaction-input" };
+	}
+	if (hasInvalidatedCompactionContext(args.branchEntries, args.compactionEntry.id)) {
+		return { ok: false, reason: "checkpoint-context-edited" };
+	}
+	const firstKept = findKeptEntryIndex(args.branchEntries, args.compactionEntry.firstKeptEntryId, boundary);
 	if (firstKept === undefined) return { ok: false, reason: "first-kept-entry-not-found" };
-	const summary = sessionEntryToContextMessages(args.compactionEntry)[0];
+	const summaryMessage = sessionEntryToContextMessages(args.compactionEntry).find(
+		(message) => message.role === "compactionSummary",
+	);
+	if (!summaryMessage) return { ok: false, reason: "compaction-summary-not-found" };
+	const summary = structuredClone(summaryMessage);
 	const summaryIndex = args.messages.findIndex((message) => areEquivalentValues(message, summary));
 	if (summaryIndex < 0) return { ok: false, reason: "compaction-summary-not-found" };
-	const retained = args.branchEntries.slice(firstKept, boundary).flatMap(sessionEntryToContextMessages);
+	const retainedIds = new Set(args.branchEntries.slice(firstKept, boundary).map((entry) => entry.id));
+	const retained = buildSessionProjection([...args.branchEntries]).entries
+		.filter((entry) => retainedIds.has(entry.sourceEntry.id))
+		.flatMap((entry) => entry.messages)
+		.map((message) => structuredClone(message));
+	// Custom messages are optional context-hook entries: a hook may filter or
+	// rewrite them before provider serialization. An exact custom copy is still
+	// removed when present, while a missing or rewritten copy is left alone.
+	// Required user/assistant/tool messages keep the ordered, fail-closed
+	// matching contract.
+	// Pi 0.86 promotes transcript system messages to the leading prompt when it
+	// rebuilds context after compaction. They can therefore appear before the
+	// compaction summary even when their session entry lies inside the retained
+	// span; keep them in place instead of treating that relocation as a mismatch.
+	const requiredRetained = retained.filter(
+		(message) => message.role !== "custom" && (message.role as string) !== "system",
+	);
+	const optionalRetained = retained.filter((message) => message.role === "custom");
 	const removed = new Set<number>();
 	let cursor = summaryIndex + 1;
-	for (const expected of retained) {
+	for (const expected of requiredRetained) {
 		const index = args.messages.findIndex((message, index) => index >= cursor && areEquivalentValues(message, expected));
 		if (index >= 0) {
 			removed.add(index);
 			cursor = index + 1;
 		}
 	}
-	// Already removed by another context handler: leave it alone. Partial
-	// matches are ambiguous; never remove half a call/result batch.
-	if (removed.size === 0) return { ok: true, messages: args.messages };
-	if (removed.size !== retained.length) return { ok: false, reason: "retained-context-mismatch" };
-	return { ok: true, messages: args.messages.filter((_, index) => !removed.has(index)) };
+	// An empty required span is valid. For a non-empty span, zero matches is
+	// ambiguous with the entire required history having been removed or changed;
+	// fail closed instead of treating it as an already-filtered no-op. Partial
+	// matches are equally unsafe because they can remove half a call/result batch.
+	if (requiredRetained.length > 0 && removed.size !== requiredRetained.length) {
+		return { ok: false, reason: "retained-context-mismatch" };
+	}
+
+	// Optional entries do not affect the strict parity decision. Search for each
+	// exact copy independently so a reordered custom entry can still be removed,
+	// but a provider-visible metadata/content rewrite remains untouched.
+	for (const expected of optionalRetained) {
+		const index = args.messages.findIndex(
+			(message, candidateIndex) =>
+				candidateIndex > summaryIndex && !removed.has(candidateIndex) && areEquivalentValues(message, expected),
+		);
+		if (index >= 0) removed.add(index);
+	}
+
+	return removed.size === 0
+		? { ok: true, messages: args.messages }
+		: { ok: true, messages: args.messages.filter((_, index) => !removed.has(index)) };
 }
 
 export function serializeLiveTailToResponsesInput<TApi extends Api>(args: {
 	model: Model<TApi>;
 	entries: readonly SessionEntry[];
 }): ResponsesInputItem[] {
-	return serializeMessagesToResponsesInput(args.model, collectReplayMessages(args.entries));
+	return serializeMessagesToResponsesInput(args.model, collectReplayMessages(args.entries), {
+		firstSystemMessageIsUpdate: true,
+	});
+}
+
+export async function serializeLiveTailToResponsesInputWithLimits<TApi extends Api>(args: {
+	model: Model<TApi>;
+	entries: readonly SessionEntry[];
+}): Promise<ResponsesInputItem[]> {
+	return serializeMessagesToResponsesInputWithLimits(args.model, collectReplayMessages(args.entries), {
+		firstSystemMessageIsUpdate: true,
+	});
 }
 
 function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
@@ -360,6 +389,7 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 	payload: ResponsesCompatibleRequestPayload;
 	branchEntries: readonly SessionEntry[];
 	compactionEntry: NativeCompactionEntry;
+	expectedInputProvenance: NativeCompactionInputProvenance;
 }): NativeReplayPayloadRewriteResult {
 	const boundaryIndex = findCompactionBoundaryIndex(args.branchEntries, args.compactionEntry.id);
 	if (boundaryIndex === undefined) {
@@ -369,7 +399,11 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const firstKeptEntryIndex = findEntryIndexByIdBeforeBoundary(
+	if (hasInvalidatedCompactionContext(args.branchEntries, args.compactionEntry.id)) {
+		return { ok: false, reason: "checkpoint-context-edited" };
+	}
+
+	const firstKeptEntryIndex = findKeptEntryIndex(
 		args.branchEntries,
 		args.compactionEntry.firstKeptEntryId,
 		boundaryIndex,
@@ -396,6 +430,12 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		return {
 			ok: false,
 			reason: "invalid-compacted-window",
+		};
+	}
+	if (!hasVerifiedCompactionInputProvenance(details, args.expectedInputProvenance)) {
+		return {
+			ok: false,
+			reason: "unverified-compaction-input",
 		};
 	}
 
@@ -462,6 +502,7 @@ export function buildNativeReplaySegments<TApi extends Api>(args: {
 	payload: ResponsesCompatibleRequestPayload;
 	branchEntries: readonly SessionEntry[];
 	compactionEntry: NativeCompactionEntry;
+	expectedInputProvenance: NativeCompactionInputProvenance;
 }): NativeReplayPayloadRewriteResult {
 	return buildNativeReplaySegmentsInternal(args);
 }
@@ -471,6 +512,7 @@ export function rewriteResponsesPayloadWithNativeReplay<TApi extends Api>(args: 
 	payload: ResponsesCompatibleRequestPayload;
 	branchEntries: readonly SessionEntry[];
 	compactionEntry: NativeCompactionEntry;
+	expectedInputProvenance: NativeCompactionInputProvenance;
 }): NativeReplayPayloadRewriteResult {
 	return buildNativeReplaySegmentsInternal(args);
 }

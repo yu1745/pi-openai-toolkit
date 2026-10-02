@@ -151,5 +151,175 @@ describe("transformWebSearchPayload", () => {
 			outcome: "invalid-include",
 			changed: false,
 		});
+
+		const explicitNonObject = transformWebSearchPayload({
+			model,
+			config: { enabled: true, models: [], defaultRoute: "hosted" },
+			payload: [],
+		});
+		expect(explicitNonObject).toMatchObject({
+			outcome: "non-object-payload",
+			changed: false,
+			fatal: true,
+		});
+	});
+
+	test("explicit local route removes hosted and standalone payload artifacts", () => {
+		const payload = {
+			model: "gpt-5.5",
+			input: [],
+			tools: [
+				{ type: "function", name: "web_search" },
+				{ type: "web_search" },
+				{ type: "web_search_preview" },
+				{ type: "function", name: "web_run" },
+				{ type: "function", name: "read" },
+			],
+			include: [WEB_SEARCH_SOURCE_INCLUDE, "reasoning.encrypted_content"],
+		};
+		const snapshot = structuredClone(payload);
+		const result = transformWebSearchPayload({
+			model,
+			config: { enabled: true, models: [], defaultRoute: "local" },
+			payload,
+		});
+
+		expect(result).toMatchObject({ outcome: "removed-conflicting-tools", changed: true });
+		expect(result.payload).toEqual({
+			...payload,
+			tools: [
+				{ type: "function", name: "web_search" },
+				{ type: "function", name: "read" },
+			],
+			include: ["reasoning.encrypted_content"],
+		});
+		expect(payload).toEqual(snapshot);
+	});
+
+	test("standalone-alpha removes hosted/local search artifacts without injecting hosted search", () => {
+		const payload = {
+			model: "gpt-5.5",
+			input: [],
+			tools: [
+				{ type: "function", name: "web_search" },
+				{ type: "web_search_preview", search_context_size: "high" },
+				{ type: "function", name: "web_run" },
+				{ type: "function", name: "web_run", description: "duplicate" },
+				{ type: "function", name: "read" },
+			],
+			include: [WEB_SEARCH_SOURCE_INCLUDE, "reasoning.encrypted_content", WEB_SEARCH_SOURCE_INCLUDE],
+		};
+		const snapshot = structuredClone(payload);
+		const result = transformWebSearchPayload({
+			model,
+			config: { enabled: true, models: [], routes: { "newapi/gpt-5.5": "standalone-alpha" } },
+			payload,
+		});
+
+		expect(result).toMatchObject({ outcome: "removed-conflicting-tools", changed: true });
+		expect(result.payload).toEqual({
+			...payload,
+			tools: [{ type: "function", name: "web_run" }, { type: "function", name: "read" }],
+			include: ["reasoning.encrypted_content"],
+		});
+		expect(payload).toEqual(snapshot);
+
+		const missingStandaloneTool = {
+			model: "gpt-5.5",
+			input: [],
+			tools: [{ type: "function", name: "read" }],
+		};
+		expect(
+			transformWebSearchPayload({
+				model,
+				config: { enabled: true, models: [], defaultRoute: "standalone-alpha" },
+				payload: missingStandaloneTool,
+			}),
+		).toMatchObject({
+			outcome: "unavailable-route",
+			changed: false,
+			fatal: true,
+		});
+	});
+
+	test("host-excluded standalone search preserves ordinary payload identity", () => {
+		for (const fields of [{}, { tools: [] }, { tools: [{ type: "function", name: "read" }] }]) {
+			const payload = { model: "gpt-5.5", input: [], ...fields };
+			const result = transformWebSearchPayload({
+				model, config: { enabled: true, models: [], defaultRoute: "standalone-alpha" },
+				payload, standaloneToolExcluded: true,
+			});
+			expect(result.fatal).not.toBe(true);
+			expect(result.changed).toBe(false);
+			expect(result.payload).toBe(payload);
+		}
+	});
+
+	test("host-excluded standalone search strips only search schemas and includes, preserving history", () => {
+		const payload = {
+			model: "gpt-5.5",
+			input: [
+				{ type: "function_call", name: "web_run", call_id: "old-search", arguments: "{}" },
+				{ type: "function_call_output", call_id: "old-search", output: "old result" },
+			],
+			tools: [
+				{ type: "function", name: "web_run" },
+				{ type: "function", name: "web_search" },
+				{ type: "web_search" }, { type: "web_search_preview" },
+				{ type: "function", name: "read" },
+			],
+			include: [WEB_SEARCH_SOURCE_INCLUDE, "reasoning.encrypted_content"],
+			unrelated: { keep: true },
+		};
+		const snapshot = structuredClone(payload);
+		const result = transformWebSearchPayload({
+			model, config: { enabled: true, models: [], defaultRoute: "standalone-alpha" },
+			payload, standaloneToolExcluded: true,
+		});
+		expect(result.fatal).not.toBe(true);
+		expect(result.changed).toBe(true);
+		expect(result.payload).toEqual({
+			...payload, tools: [{ type: "function", name: "read" }], include: ["reasoning.encrypted_content"],
+		});
+		expect(payload).toEqual(snapshot);
+		const repeated = transformWebSearchPayload({
+			model, config: { enabled: true, models: [], defaultRoute: "standalone-alpha" },
+			payload: result.payload, standaloneToolExcluded: true,
+		});
+		expect(repeated.changed).toBe(false);
+		expect(repeated.payload).toBe(result.payload);
+	});
+
+	test("host exclusion does not relax malformed standalone payload guards or change other routes", () => {
+		for (const payload of [null, { tools: "invalid" }, { include: "invalid" }]) {
+			expect(transformWebSearchPayload({
+				model, config: { enabled: true, models: [], defaultRoute: "standalone-alpha" },
+				payload, standaloneToolExcluded: true,
+			}).fatal).toBe(true);
+		}
+		for (const defaultRoute of ["hosted", "local"] as const) {
+			const args = {
+				model, config: { enabled: true, models: [], defaultRoute },
+				payload: { input: [], tools: [{ type: "function", name: "web_search" }] },
+			};
+			expect(transformWebSearchPayload({ ...args, standaloneToolExcluded: true })).toEqual(transformWebSearchPayload(args));
+		}
+	});
+
+	test("explicit route payload shape failures are fatal while legacy failures remain compatible", () => {
+		const explicit = transformWebSearchPayload({
+			model,
+			config: { enabled: true, models: [], defaultRoute: "hosted" },
+			payload: { model: "gpt-5.5", input: [], tools: "invalid" },
+		});
+		expect(explicit).toMatchObject({ outcome: "invalid-tools", changed: false, fatal: true });
+		expect(explicit.errorMessage).toContain("Hosted Web Search");
+
+		const unavailable = transformWebSearchPayload({
+			model: { ...model, api: "openai-completions" },
+			config: { enabled: true, models: [], routes: { "newapi/gpt-5.5": "standalone-alpha" } },
+			payload: { model: "gpt-5.5", input: [] },
+		});
+		expect(unavailable).toMatchObject({ outcome: "unavailable-route", changed: false, fatal: true });
 	});
 });

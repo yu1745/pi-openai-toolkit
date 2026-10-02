@@ -186,13 +186,14 @@ describe("codex astra extension wiring", () => {
 		expect(fire("before_provider_request", { type: "before_provider_request", payload: first })).toBeUndefined();
 	});
 
-	test("does not inject a stale version for native Codex models", () => {
-		for (const id of ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"]) {
+	test("does not register a global native version-header hook for any Codex model", () => {
+		for (const id of ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
 			const { handlers, fire } = createHarness({ model: codexModel({ id }) });
 			expect(handlers.has("before_provider_headers")).toBe(false);
-			const headers = { authorization: "Bearer x" };
+
+			const headers: Record<string, string | undefined> = {};
 			fire("before_provider_headers", { type: "before_provider_headers", headers });
-			expect(headers).toEqual({ authorization: "Bearer x" });
+			expect(headers.version).toBeUndefined();
 		}
 	});
 

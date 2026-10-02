@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { CODEX_CLIENT_VERSION } from "../responses-headers";
 import { codexContextProviderHeaders, resolveCodexContextProvider, _codexProviderTest } from "./codex-provider";
 
 type TestModel = {
@@ -27,6 +28,9 @@ function context(
 		modelRegistry: {
 			getApiKeyAndHeaders: async () => auth,
 		},
+		sessionManager: {
+			getSessionId: () => "test-session",
+		},
 	} as never;
 }
 
@@ -48,7 +52,23 @@ test("resolves native Codex auth from ModelRegistry and preserves account/header
 	expect(result.provider.headers["x-test"]).toBe("keep");
 	const headers = codexContextProviderHeaders(result.provider);
 	expect(headers.get("version")).toBeNull();
-	expect(codexContextProviderHeaders({ ...result.provider, headers: { Version: "0.154.0" } }).get("version")).toBe("0.154.0");
+	expect(headers.get("user-agent")).toBe(`codex_cli_rs/0.0.0 (${process.platform}; ${process.arch})`);
+});
+
+test("native context headers preserve an explicitly configured version", () => {
+	const provider = {
+		kind: "native-codex",
+		route: "openai-codex",
+		provider: "openai-codex",
+		api: "openai-codex-responses",
+		model: "gpt-5.5",
+		baseUrl: "https://chatgpt.com/backend-api/codex",
+		token,
+		accountId: "account-1",
+		headers: { Version: "0.154.0" },
+	} as const;
+
+	expect(codexContextProviderHeaders(provider).get("version")).toBe("0.154.0");
 });
 
 test("rejects a gateway or other provider even when Codex OAuth is available", async () => {
@@ -78,7 +98,11 @@ test("resolves an allowlisted Astra gateway model without native Codex account d
 		context(gatewayModel, {
 			ok: true,
 			apiKey: "newapi-key",
-			headers: { "ChatGPT-Account-ID": "must-not-forward", Cookie: "must-not-forward" },
+			headers: {
+				"ChatGPT-Account-ID": "must-not-forward",
+				Cookie: "must-not-forward",
+				"X-Management-Key": "must-not-forward",
+			},
 		}),
 		gatewayModel,
 		["uwoacrimson/gpt-6-astra"],
@@ -91,6 +115,7 @@ test("resolves an allowlisted Astra gateway model without native Codex account d
 		expect(result.provider.model).toBe("gpt-6-astra");
 		expect(result.provider.headers).not.toHaveProperty("Cookie");
 		expect(result.provider.headers).not.toHaveProperty("ChatGPT-Account-ID");
+		expect(result.provider.headers).not.toHaveProperty("X-Management-Key");
 	}
 
 	// Gateway coverage is allowlist-driven: an unlisted SKU stays outside
@@ -114,6 +139,45 @@ test("resolves an allowlisted Astra gateway model without native Codex account d
 	expect(noAllowlist).toMatchObject({ ok: false, reason: "unsupported-model" });
 });
 
+test("resolves a virtual selection to its physical gateway model before context auth", async () => {
+	const virtual = model({ provider: "router", api: "pi-virtual", id: "auto", baseUrl: "" });
+	const physical = model({ provider: "my-gateway", api: "openai-responses", id: "gpt-6.1-sol", baseUrl: "https://newapi.example/v1" });
+	const result = await resolveCodexContextProvider({
+		model: virtual,
+		modelRegistry: {
+			getApiKeyAndHeaders: async (current: TestModel) => ({
+				ok: true,
+				apiKey: current.id === physical.id ? "gateway-key" : undefined,
+				baseUrl: physical.baseUrl,
+			}),
+			find: (_provider: string, id: string) => id === physical.id ? physical : undefined,
+			runtime: {
+				resolveModel: async () => ({ model: physical, thinkingLevel: "off" }),
+			},
+		},
+		sessionManager: {
+			getSessionId: () => "virtual-session",
+			buildSessionProjection: () => ({ messages: [] }),
+		},
+	} as never, virtual, ["router/auto"]);
+
+	expect(result.ok).toBe(true);
+	if (result.ok) {
+		expect(result.provider.kind).toBe("codex-gateway");
+		expect(result.provider.provider).toBe(physical.provider);
+		expect(result.provider.model).toBe(physical.id);
+	}
+});
+
+test("rejects gateway context when the Pi session has no stable identity", async () => {
+	const gatewayModel = model({ provider: "my-gateway", api: "openai-responses", id: "gpt-5.6-luna", baseUrl: "https://newapi.example/v1" });
+	const result = await resolveCodexContextProvider({
+		model: gatewayModel,
+		modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "newapi-key" }) },
+	} as never, gatewayModel, ["my-gateway/gpt-5.6-luna"]);
+	expect(result).toMatchObject({ ok: false, reason: "missing-session-id" });
+});
+
 test("preserves the bare gateway model and affinity headers", () => {
 	const headers = codexContextProviderHeaders({
 		kind: "codex-gateway",
@@ -127,8 +191,28 @@ test("preserves the bare gateway model and affinity headers", () => {
 	}, { sessionId: "session-1" });
 	expect(headers.get("X-Codex-Model")).toBe("gpt-5.5");
 	expect(headers.get("X-Codex-Affinity-Scope")).toBe("codex-session-v1");
+	expect(headers.get("User-Agent")).toBe(`codex_cli_rs/${CODEX_CLIENT_VERSION} (${process.platform}; ${process.arch})`);
 	expect(headers.get("Session-Id")).toBe("session-1");
+	// The gateway hop no longer receives an automatic client version pin.
 	expect(headers.get("version")).toBeNull();
+});
+
+test("keeps an explicitly configured gateway version and never adds its own", () => {
+	const base = {
+		kind: "codex-gateway",
+		route: "codex-gateway",
+		provider: "uwoacrimson",
+		api: "openai-responses",
+		model: "gpt-5.5",
+		baseUrl: "https://newapi.example/v1",
+		apiKey: "newapi-key",
+	} as const;
+
+	const explicit = codexContextProviderHeaders({ ...base, headers: { Version: "0.154.0" } });
+	expect(explicit.get("version")).toBe("0.154.0");
+
+	const absent = codexContextProviderHeaders({ ...base, headers: {} });
+	expect(absent.get("version")).toBeNull();
 });
 
 test("normalizes thrown and explicit auth failures without exposing credential text", async () => {

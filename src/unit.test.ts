@@ -8,6 +8,7 @@ import { executeRemoteV2Compaction } from "./remote-v2-client";
 import { buildCompactUrl, buildResponsesUrl } from "./runtime";
 import {
 	DEFAULT_COMPACTION_CONFIG,
+	NATIVE_COMPACTION_INPUT_PROVENANCE,
 	createNativeCompactionDetails,
 	isNativeCompactionDetails,
 } from "./types";
@@ -102,12 +103,16 @@ test("native compaction details preserve optional producer identity and legacy c
 		api: "openai-responses",
 		model: "gpt-5.6-sol",
 		baseUrl: "https://gateway.example/v1",
+		inputProvenance: NATIVE_COMPACTION_INPUT_PROVENANCE,
 		compactionModel: producer,
 		compactedWindow: [{ type: "compaction", encrypted_content: "opaque" }],
 		createdAt: "2026-08-18T00:00:00.000Z",
 	});
 	producer.model = "mutated-after-create";
 
+	expect(details.inputProvenance).toBe(NATIVE_COMPACTION_INPUT_PROVENANCE);
+	expect(isNativeCompactionDetails({ ...details, inputProvenance: undefined })).toBe(true);
+	expect(isNativeCompactionDetails({ ...details, inputProvenance: "unknown" })).toBe(false);
 	expect(details.compactionModel).toEqual({
 		provider: "uwoacrimson",
 		api: "openai-responses",
@@ -209,7 +214,7 @@ test("executeRemoteV2Compaction sends a trigger and accepts exactly one complete
 				`event: keepalive\ndata: ${JSON.stringify({ type: "keepalive" })}`,
 				`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item: opaque })}`,
 				`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_v2", created_at: 1_800_000_000, status: "completed", output: [opaque], usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 } } })}`,
-			].join("\n\n"),
+			].join("\n\n") + "\n\n",
 			{ status: 200, headers: { "content-type": "text/event-stream" } },
 		);
 	}) as typeof fetch;
@@ -480,7 +485,7 @@ test("remote v2 compaction request strips Astra configuration_update items from 
 				`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp_v2", status: "in_progress", output: [] } })}`,
 				`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item: opaque })}`,
 				`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_v2", created_at: 1_800_000_000, status: "completed", output: [opaque], usage: {} } })}`,
-			].join("\n\n"),
+			].join("\n\n") + "\n\n",
 			{ status: 200, headers: { "content-type": "text/event-stream" } },
 		);
 	}) as typeof fetch;
@@ -557,7 +562,7 @@ test("native v1 compact request strips Astra configuration_update items", async 
 	expect(input[0]!.type).not.toBe("configuration_update");
 });
 
-test("codex compaction requests carry affinity without a default version", async () => {
+test("codex compaction requests carry session affinity headers without a default version", async () => {
 	let fetchInit: RequestInit | undefined;
 	globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
 		fetchInit = init;

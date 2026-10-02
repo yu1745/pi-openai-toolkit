@@ -1,4 +1,7 @@
 export const IMAGE_GENERATION_TOOL_NAME = "openai_generate_image";
+/** Image formats accepted from independent Images API responses. */
+export const IMAGE_GENERATION_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+/** Backward-compatible default format for callers that construct PNG-only fixtures. */
 export const IMAGE_GENERATION_MIME_TYPE = "image/png" as const;
 export const IMAGE_GENERATION_CAPABLE_APIS = [
 	"openai-responses",
@@ -23,15 +26,28 @@ export const IMAGE_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 export const MAX_IMAGE_PATH_CHARS = 4096;
 export const MAX_IMAGE_DIAGNOSTIC_CHARS = 4096;
 export const MAX_IMAGE_IDENTIFIER_CHARS = 256;
-/** Upper bound for a configured or requested `image_generation` model id. */
+/** Upper bound for a configured or requested Images API model id. */
 export const MAX_IMAGE_MODEL_ID_CHARS = 256;
+export const MAX_IMAGE_BATCH_SIZE = 10;
 export const MAX_IMAGE_DIMENSION = 100_000;
 
 export type ImageGenerationCapableApi = (typeof IMAGE_GENERATION_CAPABLE_APIS)[number];
 export type ImageGenerationSize = (typeof IMAGE_GENERATION_SIZES)[number];
 export type ImageGenerationQuality = (typeof IMAGE_GENERATION_QUALITIES)[number];
 export type ImageGenerationAction = "generate" | "edit";
-export type ReferenceImageMimeType = "image/png" | "image/jpeg" | "image/webp";
+export type ImageGenerationMimeType = (typeof IMAGE_GENERATION_MIME_TYPES)[number];
+export type ReferenceImageMimeType = ImageGenerationMimeType;
+
+export function imageFileExtension(mimeType: ImageGenerationMimeType): "png" | "jpg" | "webp" {
+	switch (mimeType) {
+		case "image/png":
+			return "png";
+		case "image/jpeg":
+			return "jpg";
+		case "image/webp":
+			return "webp";
+	}
+}
 
 export type ImageGenerationModel = {
 	api?: string;
@@ -45,8 +61,10 @@ export type GenerateImageParams = {
 	outputPath?: string | null;
 	size?: ImageGenerationSize;
 	quality?: ImageGenerationQuality;
-	/** Optional bare image model id that must exist in `imageGeneration.models`. */
+	/** Optional bare image model id that must exist in the configured image model allowlist. */
 	model?: string | null;
+	/** Number of independent image requests to run concurrently. */
+	batchSize?: number | null;
 };
 
 export type NormalizedGenerateImageParams = {
@@ -56,6 +74,7 @@ export type NormalizedGenerateImageParams = {
 	size: ImageGenerationSize;
 	quality: ImageGenerationQuality;
 	action: ImageGenerationAction;
+	batchSize: number;
 	/** Trimmed requested model id, or undefined when the caller omitted it. */
 	model?: string;
 };
@@ -68,6 +87,7 @@ export type PreparedReferenceImage = {
 
 export type ParsedGeneratedImage = {
 	bytes: Buffer;
+	mimeType: ImageGenerationMimeType;
 	imageCallId: string;
 	responseId?: string;
 	revisedPrompt?: string;
@@ -82,7 +102,7 @@ export type ImageGenerationDetails = {
 	imageModel: string;
 	imageCallId: string;
 	responseId?: string;
-	mimeType: typeof IMAGE_GENERATION_MIME_TYPE;
+	mimeType: ImageGenerationMimeType;
 	byteCount: number;
 	width: number;
 	height: number;
@@ -92,8 +112,25 @@ export type ImageGenerationDetails = {
 	warning?: string;
 };
 
+export type ImageGenerationBatchFailure = {
+	index: number;
+	code: ImageGenerationFailureCode;
+	message: string;
+};
+
+export type ImageGenerationBatchDetails = {
+	batch: true;
+	requestedCount: number;
+	succeededCount: number;
+	failedCount: number;
+	images: ImageGenerationDetails[];
+	failures?: ImageGenerationBatchFailure[];
+};
+
+export type ImageGenerationToolDetails = ImageGenerationDetails | ImageGenerationBatchDetails;
+
 export type ImageGenerationExecutionResult = {
-	details: ImageGenerationDetails;
+	details: ImageGenerationToolDetails;
 	text: string;
 };
 
@@ -120,6 +157,35 @@ export type ImageGenerationFailureCode =
 	| "no-image"
 	| "artifact-write-failed";
 
+function isImageGenerationFailureCode(value: unknown): value is ImageGenerationFailureCode {
+	switch (value) {
+		case "aborted":
+		case "timeout":
+		case "disabled":
+		case "unsupported-model":
+		case "missing-runtime":
+		case "invalid-parameters":
+		case "reference-input-invalid":
+		case "reference-upload-approval-required":
+		case "reference-upload-declined":
+		case "output-path-invalid":
+		case "output-path-approval-required":
+		case "output-path-declined":
+		case "authentication":
+		case "rate-limit":
+		case "request-rejected":
+		case "backend-unavailable":
+		case "network":
+		case "oversized-response":
+		case "malformed-response":
+		case "no-image":
+		case "artifact-write-failed":
+			return true;
+		default:
+			return false;
+	}
+}
+
 export class ImageGenerationError extends Error {
 	readonly code: ImageGenerationFailureCode;
 
@@ -138,6 +204,10 @@ function isBoundedString(value: unknown, maxChars: number): value is string {
 	return typeof value === "string" && value.trim().length > 0 && value.length <= maxChars;
 }
 
+function isImageGenerationMimeType(value: unknown): value is ImageGenerationMimeType {
+	return (IMAGE_GENERATION_MIME_TYPES as readonly string[]).includes(value as string);
+}
+
 export function isImageGenerationDetails(value: unknown): value is ImageGenerationDetails {
 	if (!isRecord(value)) return false;
 	return (
@@ -147,7 +217,7 @@ export function isImageGenerationDetails(value: unknown): value is ImageGenerati
 		isBoundedString(value.imageModel, MAX_IMAGE_MODEL_ID_CHARS) &&
 		isBoundedString(value.imageCallId, MAX_IMAGE_IDENTIFIER_CHARS) &&
 		(value.responseId === undefined || isBoundedString(value.responseId, MAX_IMAGE_IDENTIFIER_CHARS)) &&
-		value.mimeType === IMAGE_GENERATION_MIME_TYPE &&
+		isImageGenerationMimeType(value.mimeType) &&
 		typeof value.byteCount === "number" &&
 		Number.isInteger(value.byteCount) &&
 		value.byteCount > 0 &&
@@ -168,6 +238,47 @@ export function isImageGenerationDetails(value: unknown): value is ImageGenerati
 		(value.revisedPrompt === undefined || isBoundedString(value.revisedPrompt, MAX_IMAGE_DIAGNOSTIC_CHARS)) &&
 		(value.warning === undefined || isBoundedString(value.warning, MAX_IMAGE_DIAGNOSTIC_CHARS))
 	);
+}
+
+function isBoundedIndex(value: unknown, maximum: number): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < maximum;
+}
+
+export function isImageGenerationBatchDetails(value: unknown): value is ImageGenerationBatchDetails {
+	if (!isRecord(value) || value.batch !== true) return false;
+	if (
+		typeof value.requestedCount !== "number" ||
+		!Number.isInteger(value.requestedCount) ||
+		value.requestedCount < 2 ||
+		value.requestedCount > MAX_IMAGE_BATCH_SIZE ||
+		typeof value.succeededCount !== "number" ||
+		!Number.isInteger(value.succeededCount) ||
+		value.succeededCount < 1 ||
+		value.succeededCount > value.requestedCount ||
+		typeof value.failedCount !== "number" ||
+		!Number.isInteger(value.failedCount) ||
+		value.failedCount !== value.requestedCount - value.succeededCount ||
+		!Array.isArray(value.images) ||
+		value.images.length !== value.succeededCount ||
+		!value.images.every(isImageGenerationDetails)
+	) {
+		return false;
+	}
+	if (value.failedCount === 0) return value.failures === undefined;
+	if (!Array.isArray(value.failures) || value.failures.length !== value.failedCount) return false;
+	const requestedCount = value.requestedCount;
+	const indexes = new Set<number>();
+	return value.failures.every((failure) => {
+		if (!isRecord(failure) || !isBoundedIndex(failure.index, requestedCount)) return false;
+		if (!isImageGenerationFailureCode(failure.code) || !isBoundedString(failure.message, MAX_IMAGE_DIAGNOSTIC_CHARS)) return false;
+		if (indexes.has(failure.index)) return false;
+		indexes.add(failure.index);
+		return true;
+	});
+}
+
+export function isImageGenerationToolDetails(value: unknown): value is ImageGenerationToolDetails {
+	return isImageGenerationDetails(value) || isImageGenerationBatchDetails(value);
 }
 
 export function sanitizeImageDiagnostic(value: unknown, fallback: string): string {

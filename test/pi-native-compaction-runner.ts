@@ -5,7 +5,8 @@ import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-
 import { createSmokeEnvironment } from "./pi-smoke-environment";
 
 const packageDir = resolve(import.meta.dirname, "..");
-const mode = process.argv[2];
+const holdCompactionBodyOpen = process.argv[2] === "manual-open";
+const mode = holdCompactionBodyOpen ? "manual" : process.argv[2];
 assert(["threshold", "disabled", "under", "manual", "cancel", "failure"].includes(mode));
 const env = await createSmokeEnvironment();
 process.env.PI_CACHE_RETENTION = "long";
@@ -13,10 +14,12 @@ try {
 	const { createAgentSession, DefaultResourceLoader, defineTool, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 	const { fauxAssistantMessage, InMemoryCredentialStore, InMemoryModelsStore, Type } = await import("@earendil-works/pi-ai");
 	const manifest = JSON.parse(await readFile(join(packageDir, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8"));
-	assert.equal(manifest.version, "0.85.1");
+	const packageManifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+	const expectedPiVersion = packageManifest.devDependencies?.["@earendil-works/pi-coding-agent"];
+	assert.equal(manifest.version, expectedPiVersion, `Unexpected local Pi version: ${manifest.version}; expected ${expectedPiVersion}`);
 	const configDir = join(env.agentDir, "extensions/pi-openai-toolkit");
 	await mkdir(configDir, { recursive: true });
-	await writeFile(join(configDir, "config.json"), JSON.stringify({ compaction: { contextManagement: "off", nativeFallback: { enabled: false } } }));
+	await writeFile(join(configDir, "config.json"), JSON.stringify({ compaction: { nativeFallback: { enabled: false } } }));
 	const modelRuntime = await ModelRuntime.create({
 		credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null,
 		refreshOnCreate: false, allowModelNetwork: false,
@@ -46,13 +49,14 @@ try {
 	let liveCount = 0;
 	let remoteCount = 0;
 	let nativeSummaryCount = 0;
+	let compactionBodyCancelled = 0;
 	let compactionsAtContinuation = -1;
 	const liveBodies: Array<Record<string, unknown>> = [];
 	const compactBodies: Array<Record<string, unknown>> = [];
 	const hooks: string[] = [];
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: env.cwd, agentDir: env.agentDir, settingsManager,
-		additionalExtensionPaths: [join(packageDir, "extensions/compaction.ts")],
+		additionalExtensionPaths: [join(packageDir, "src/extension-runtime.ts")],
 		noSkills: true, noPromptTemplates: true, noContextFiles: true, noThemes: true,
 		systemPrompt: "Run the requested deterministic tools, then finish.",
 		extensionFactories: [(pi) => {
@@ -85,8 +89,15 @@ try {
 		}
 		events.push({ type: "response.completed", response: { id, status: "completed", created_at: 1800000000,
 			...(!metadataOnly ? { output } : {}), usage: { input_tokens: id === "resp_tools" ? 1900 : 100, output_tokens: 10, total_tokens: id === "resp_tools" ? 1910 : 110 } } });
-		return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
-			{ status: 200, headers: { "content-type": "text/event-stream" } });
+		const text = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+		const body = holdCompactionBodyOpen && id === "resp_compact"
+			? new ReadableStream<Uint8Array>({
+				start(controller) { controller.enqueue(new TextEncoder().encode(text)); },
+				// No EOF: the validated terminal frame must release the continuation.
+				cancel() { compactionBodyCancelled++; },
+			})
+			: text;
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 	}
 	function textResponse(text: string) {
 		return streamResponse([{ type: "message", id: `msg_${liveCount}_${nativeSummaryCount}`, role: "assistant", status: "completed",
@@ -166,6 +177,7 @@ try {
 		if (mode === "cancel") assert(events.some((event) => event.type === "compaction_end" && event.aborted));
 		assert.equal(nativeSummaryCount, mode === "failure" ? 1 : 0);
 		assert(!sessionManager.getBranch().some((entry) => entry.type === "custom_message"));
+		if (holdCompactionBodyOpen) assert.equal(compactionBodyCancelled, 1);
 		env.assertNoNetwork();
 	} finally {
 		unsubscribe();

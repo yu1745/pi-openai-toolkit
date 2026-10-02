@@ -1,225 +1,156 @@
 # pi-openai-toolkit
 
-为 Pi 添加本地上下文窗口、Responses 压缩、托管工具和工具调用审查。
+为 Pi 添加远程上下文窗口、Responses 压缩、联网搜索、图像生成和工具调用审查。沿用 Pi 的模型、端点、认证和会话配置，不另行注册提供商或模型。
 
 [![npm 版本](https://img.shields.io/npm/v/pi-openai-toolkit.svg)](https://www.npmjs.com/package/pi-openai-toolkit)
-[![许可证：MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
+[![MIT](https://img.shields.io/npm/l/pi-openai-toolkit.svg)](LICENSE)
 
-[英文版](README.md)
+[English](README.md)
 
-## 功能
+## 安装与快速开始
 
-| 功能 | 用途 |
-| --- | --- |
-| 本地上下文管理 | 切换到新上下文窗口，并通过本地 `history` 与 `notes` 按需检索较早窗口。 |
-| 远程压缩 v2 | 使用服务端返回的加密检查点继续符合条件的 Responses 会话。 |
-| 托管联网搜索 | 为指定模型启用 OpenAI 托管的搜索工具。 |
-| 图像生成 | 生成图片，或根据明确传入的本地参考图片进行编辑。 |
-| 工具调用审查 | 在指定范围的工具调用执行前，由审查模型判断是否允许执行。 |
-
-本包沿用 Pi 已有的模型、认证和会话配置，不新增提供商或模型。
-
-## 安装
-
-需要 Pi 0.85.1 或更高版本，以及 Node.js 22.19.0 或更高版本。
-
-安装扩展：
+需要 Node.js **22.19.0+**、Pi **0.87.0+**。当前开发依赖锁定 Pi **0.99.1**；后端功能是否可用，还取决于所选模型、接口和账号权限。
 
 ```bash
 pi install npm:pi-openai-toolkit
 ```
 
-在当前项目中安装时，在命令后加上 `--local`。
+在 Pi 中配置好模型和凭据后，照常启动。没有 Toolkit 配置文件时，符合条件的模型默认使用远程压缩；搜索由 Pi 和其他扩展管理，生图和 Auto Mode 默认关闭。
 
-只安装扩展不会自动启用所有功能。没有扩展配置时，压缩模块处于开启状态，但本地上下文管理关闭，联网搜索没有目标模型，图像生成关闭，自动模式也没有允许的模型和审查模型。
+Toolkit 只读取一个全局配置文件，即使扩展安装在项目内也一样：
 
-扩展配置文件位于：
+```text
+~/.pi/agent/extensions/pi-openai-toolkit/config.json
+```
 
-`~/.pi/agent/extensions/pi-openai-toolkit/config.json`
-
-下文除 `models.json` 示例外，其他 JSON 配置示例都写入此文件。文件不存在时，创建文件及所需目录；已有配置时，将字段合并到对应对象中，保留其他设置。
-
-## 快速开始：启用上下文管理
-
-本节适用于想使用 Codex 风格上下文窗口的用户。如果只需要联网搜索、图像生成或工具调用审查，请直接跳到[常见用法](#常见用法)。
-
-### 使用任意已配置的 Pi 模型
-
-上下文管理采用混合路由：白名单中的原生 `openai-codex` 模型使用托管 history/notes 和无摘要滚动窗口；其他服务商使用本地后端。未列入滚动窗口白名单的原生 Codex 模型保持上下文管理关闭，并走独立的远程压缩 v2 路径。普通模型推理仍使用 Pi 已配置的提供商认证。
-
-创建或合并扩展配置：
+新建配置时，按需创建父目录，使用 v2 格式：
 
 ```json
 {
-  "compaction": {
-    "contextManagement": "auto"
+  "schemaVersion": 2,
+  "defaults": {
+    "context": { "mode": "remote-compaction" }
   }
 }
 ```
 
-使用任意已经在 Pi 中配置的模型启动，例如：
+在 Pi 中检查配置：
 
-```bash
-pi --model openai-codex/<model-id>
-```
+- `/toolkit-config`：查看当前生效值及其来源
+- `/toolkit-config validate`：检查配置错误
+- `/toolkit-config migration-preview`：预览旧格式迁移，不写入文件
 
-会话中出现 `new_context`、`get_context_remaining`、`history` 和 `notes` 工具，说明扩展已经完成启用检查。设置 `contextManagement: "auto"` 后，非 Codex 服务商使用本地后端：不会调用 Codex alpha history/notes、写入托管上下文 header 或重写 encrypted tool output。本地 Notes 与 History 按 **根任务/session** 隔离，再按 Agent Name 命名；不再默认共享同项目其他会话的数据。显式关联的子代理即使使用其他 cwd/worktree，也属于同一根任务。主代理默认为 `/root`；子代理身份须由宿主传递，不能从项目路径、显示名或 `parentSession` 猜测。详见[本地上下文对齐范围](docs/context-management-parity.md)。
+配置按“内置默认值 → `defaults` → `models["provider/model-id"]`”覆盖。模型键精确匹配、区分大小写，不支持通配符或项目级配置。以下示例按需合并到现有文件，不要覆盖其他设置；没有 `schemaVersion` 的旧配置先看[迁移说明](docs/configuration.md#legacy-compatibility-and-migration)。
 
-托管滚动窗口白名单从 `~/.pi/agent/settings.json` 的 `openaiToolkit.codexContextModels` 只读读取，不会修改该文件。默认值为 `openai-codex/gpt-6-astra` 和 `openai-codex/gpt-5.6-sol`。只有白名单中的原生 Codex 模型使用托管传输；未列入白名单的原生 Codex 模型不会获得上下文管理工具或窗口所有权。
+## 上下文管理
 
-### 使用其他服务商或网关
+通过 `defaults.context.mode` 或单个模型的 `context.mode` 选择：
 
-如果 `~/.pi/agent/models.json` 中已有该模型，可以跳过模型配置。否则，先添加或合并下面的提供商配置。请把 `my-gateway`、地址、环境变量名称和模型字段替换成实际值。示例中的数字只是示意值，不是项目默认值，必须改成符合实际模型与网关能力的上下文窗口和最大输出 token 数。
+- `remote-compaction`：默认模式，使用服务端返回的加密检查点继续会话
+- `remote-windows`：使用 Codex 远程上下文窗口，通过 `history` 检索较早内容、`notes` 保存交接信息
+- `pi`：交给 Pi 管理上下文
+
+**远程压缩**支持的 API 类型是 `openai-responses`、`openai-codex-responses` 和 `azure-openai-responses`，但后端仍须支持对应的检查点协议。可用 `context.remoteCompaction.model` 指定独立的压缩模型；远程压缩要求它与当前模型使用相同的有效 base URL。原生摘要回退有独立配置，并非所有失败都会回退；空检查点、来源不匹配或被修改的已封存历史会阻止存储或重放。详见[上下文配置](docs/configuration.md#context)和[检查点规则](docs/internals.md#remote-compaction-v2-wire-contract)。
+
+**远程窗口**需要原生 `openai-codex` 提供商的 `openai-codex-responses` API，或支持相应协议的 `openai-responses` 网关。网关必须在精确模型下设置 `compatibility.transport: "codex-gateway"`；这一设置不会让普通兼容端点自动获得该能力。
+
+将上例的 `mode` 改为 `remote-windows` 后，符合条件的会话会提供 `new_context`、`get_context_remaining`、`history` 和 `notes`。手动 `/compact [instructions]` 会发起检查点交接：先成功写入 notes，再切换窗口。不具备窗口能力的模型仍走压缩流程；窗口激活失败不会静默改用摘要。
+
+远程窗口依赖 alpha 接口，上游可能随时调整。切换模型前也要留意旧窗口历史仍未清理的情况，详见[窗口生命周期](docs/internals.md#rollover-lifecycle)。
+
+## 搜索、生图与工具审查
+
+### 联网搜索
+
+在 `defaults.webSearch.route` 或精确模型的 `webSearch.route` 中选择：
+
+- `unmanaged`：默认值，不接管搜索；这不等于禁止联网
+- `local`：保留已有本地搜索工具（如 `pi-web-access`），不会安装或启用原本未启用的工具
+- `hosted`：使用 Responses `web_search` 并返回来源标注，停用冲突的本地搜索工具
+- `standalone-alpha`：实验性 `web_run`，通过独立的 `/alpha/search` 请求执行搜索、打开页面等操作
+
+`hosted` 支持上述三类 Responses API，仍需后端和账号支持搜索。`standalone-alpha` 仅支持已验证的 OpenAI/Codex 路由，网关还须提供对应端点及能力。选定路由不可用、缺少认证或发生工具冲突时，不会自动换到另一条路由。完整操作列表见[搜索配置](docs/configuration.md#web-search)。
+
+### 图像生成
+
+生图配置只放在全局 `defaults.imageGeneration`。将示例中的 `image-model-id` 替换为后端实际支持的图片模型 ID：
 
 ```json
 {
-  "providers": {
-    "my-gateway": {
-      "baseUrl": "https://your-gateway.example/v1",
-      "api": "openai-responses",
-      "apiKey": "$MY_GATEWAY_KEY",
-      "models": [{
-        "id": "gpt-5.6-luna",
-        "name": "GPT-5.6 Luna",
-        "reasoning": true,
-        "input": ["text"],
-        "contextWindow": 272000,
-        "maxTokens": 128000
-      }]
+  "schemaVersion": 2,
+  "defaults": {
+    "imageGeneration": {
+      "enabled": true,
+      "defaultModel": "image-model-id",
+      "allowedModels": ["image-model-id"]
     }
   }
 }
 ```
 
-在启动 Pi 之前设置配置中引用的密钥。PowerShell 使用：
+启用后，符合条件的会话提供 `openai_generate_image`，支持生成、参考图编辑和批量生成。当前会话模型负责路由和认证，图片模型通过独立 Images API 调用，不会替换对话模型。默认图片模型为 `grok-imagine-image-2.0`，不代表你的后端一定支持它；`defaultModel` 必须包含在 `allowedModels` 中。
 
-```powershell
-$env:MY_GATEWAY_KEY = "replace-with-your-gateway-key"
-```
+目前要求 `openai-responses` 或 `openai-codex-responses` 路由，以及可用的 Images API。返回结果须为 base64 编码的 PNG、JPEG 或 WebP。`batchSize` 为 1–10，每张图是一次独立请求，可能单独计费；部分失败会保留已保存的图片。编辑会向提供商发送参考图，请确认这些图片可以上传。详见[生图配置](docs/configuration.md#images)。
 
-POSIX shell 使用：
+### Responses WebSocket 传输
 
-```bash
-export MY_GATEWAY_KEY="replace-with-your-gateway-key"
-```
-
-使用同一个终端启动 Pi。创建或合并扩展配置：
+Toolkit 的 WebSocket adapter 默认关闭。对使用 Pi `openai-responses` API 的 GPT 模型，可通过全局配置开启：
 
 ```json
 {
-  "compaction": {
-    "contextManagement": "auto"
+  "schemaVersion": 2,
+  "defaults": {
+    "responsesWebSocket": { "enabled": true }
   }
 }
 ```
 
-使用相同的模型标识启动 Pi：
+它沿用当前模型的 provider、base URL、凭据、headers 和 model ID，不注册新的 provider。Pi 的 `transport: "auto"` 会先尝试 WebSocket，并在开始流式输出前回退到 SSE；会话 ID 稳定时还会复用连接，并在历史匹配时只发送新的 continuation 输入。使用 `transport: "websocket-cached"` 可强制要求缓存连接路径，使用 `transport: "sse"` 则保持原有 HTTP/SSE 路径。修改 Toolkit 配置后请重启或 reload Pi。详见[WebSocket 配置](docs/configuration.md#responses-websocket-transport)。
 
-```bash
-pi --model my-gateway/gpt-5.6-luna
-```
+### Auto Mode
 
-启用检查方式相同：会话中应该出现 `new_context`、`get_context_remaining`、`history` 和 `notes`。如果没有出现，先查看工具包通知，再检查扩展配置和工具名称冲突。
-
-较早窗口的历史仍可通过 `history` 检索和读取，但不会全部自动加入当前上下文。
-
-## 常见用法
-
-### 使用服务端压缩继续会话
-
-如果希望使用 Responses 压缩路径，就将上下文管理设为 `"off"`。在 `contextManagement: "auto"` 下，未列入白名单的原生 Codex 模型也会走这个独立的远程压缩 v2 路径，而不会获得无摘要滚动窗口。远程压缩 v2 会为符合条件的 Responses 模型保存并回放加密检查点。只有在压缩请求需要使用其他模型时，才设置 `compaction.remoteCompactModel`。
-
-### 启用托管联网搜索
-
-在 `webSearch.models` 中填写精确的模型标识：
+Auto Mode 在工具执行前进行模型审查。先允许使用并指定 Pi 中已注册、可认证的审查模型，再手动开启：
 
 ```json
 {
-  "webSearch": {
-    "models": ["my-gateway/gpt-5.6-luna"]
+  "schemaVersion": 2,
+  "defaults": {
+    "autoMode": {
+      "available": true,
+      "reviewerModel": "provider/reviewer-model-id"
+    }
   }
 }
 ```
 
-对于这些模型，扩展会用 OpenAI 托管的 Responses 搜索工具替代 Pi 本地的 `web_search` 工具。
+将 `provider/reviewer-model-id` 替换为实际模型。用 `/auto on` 或启动参数 `--auto` 开启，`/auto off` 关闭；只设置 `available: true` 不会自动开启。
 
-### 生成图片
+默认 `gate: "side-effect"` 审查 `bash`、`write`、`edit` 和 `extraTools` 中的工具，`gate: "all"` 审查所有工具。支持只读取证、拒绝次数熔断和可选的后台分类器预评分；开启分类器后，部分调用可依据预评分放行。
 
-图像生成需要 Responses 会话，并且可能产生服务商费用。启用方式如下：
+审查超时或不可用不算批准：交互模式会请求用户确认，无界面模式会阻止调用。它不是沙箱，也不保证每次判断正确；选择不符合条件的模型会关闭 Auto Mode。完整配置见[Auto Mode](docs/configuration.md#auto-mode)。
 
-```json
-{
-  "imageGeneration": {
-    "enabled": true,
-    "models": ["gpt-image-2.5", "grok-imagine-image-2.0"]
-  }
-}
-```
+## 兼容性与排查
 
-`models` 填写嵌套 Responses `image_generation` 工具使用的裸模型 ID。列表第一项是默认模型；`openai_generate_image` 也支持通过可选的 `model` 参数在单次调用中切换，但该值必须与配置列表中的某一项完全一致。省略 `models` 时默认使用 `gpt-image-2.5`。列表为空或格式无效时会告警并回退到默认模型；如果要关闭工具，将 `enabled` 设置为 `false`。服务商或网关必须实际支持配置的生图模型。
+- 提供商、端点和凭据仍由 Pi 管理，不写进 Toolkit 配置。Azure 的部署映射、`api-version` 和认证说明见[提供商配置](docs/configuration.md#provider-specific-responses-endpoints)
+- `pi-virtual` 使用 Pi 解析出的实际提供商和模型检查能力，不按虚拟模型名称推断支持情况
+- 压缩和重放时遵守 Pi 模型元数据中的 `inputLimits.images` 缩放与数量限制，不修改持久化会话或原始请求对象
+- 无效配置会阻止依赖它的操作。先运行 `/toolkit-config validate`，再检查模型、认证和后端能力；配置校验通过不等于端点可用
+- 请求与压缩响应记录默认关闭。排查时才开启 `diagnostics.captureRequests` / `captureResponses`，分享日志前检查是否包含对话内容
 
-`openai_generate_image` 支持文生图，也支持使用明确传入的本地参考图片进行编辑。
-
-### 启用工具调用自动审查
-
-在 `autoMode` 中设置允许使用的模型和审查模型：
-
-```json
-{
-  "autoMode": {
-    "models": ["my-gateway/gpt-5.6-luna"],
-    "reviewerModel": "my-gateway/gpt-5.6-luna"
-  }
-}
-```
-
-在会话中使用 `/auto on`。默认的 `side-effect` 审查范围覆盖 `bash`、`write`、`edit` 和额外配置的工具。如果需要审查所有工具调用，将 `gate` 设置为 `"all"`。审查超时不会自动放行调用。
-
-## 常用配置
-
-配置文件为 `~/.pi/agent/extensions/pi-openai-toolkit/config.json`。未知键会告警后忽略。大多数模型列表必须使用精确的 `provider/model-id` 字符串，不支持通配符；`imageGeneration.models` 是例外，填写嵌套生图工具使用的裸模型 ID。
-
-| 配置项 | 默认值 | 用途 |
-| --- | --- | --- |
-| `compaction.enabled` | `true` | 压缩功能总开关。 |
-| `compaction.contextManagement` | `"off"` | `"auto"`：白名单原生 `openai-codex` 模型使用托管滚动窗口，非 Codex 服务商使用本地 history/notes 与上下文窗口，未列入白名单的原生 Codex 模型使用独立的远程压缩 v2；未知值按关闭处理。 |
-| `compaction.gatewayContextModels` | `openai-codex/gpt-6-astra`、`openai-codex/gpt-5.6-sol` | 托管原生 Codex 滚动窗口白名单；存在时从 `settings.json` 的 `openaiToolkit.codexContextModels` 同步。 |
-| `compaction.remoteCompactModel` | 未设置 | 仅用于 v2 压缩请求的可选模型。 |
-| `compaction.contextReminderThresholdPercent` | `5` | 每个窗口触发一次提醒的剩余预算百分比。设置为 `0` 会关闭提醒和窗口耗尽兜底。 |
-| `webSearch.models` | `[]` | 使用托管联网搜索的模型。 |
-| `imageGeneration.enabled` | `false` | 启用 `openai_generate_image`。 |
-| `imageGeneration.models` | `["gpt-image-2.5"]` | 裸生图模型 ID；列表第一项是默认模型。 |
-| `autoMode.models` | `[]` | 允许使用自动模式的模型。 |
-| `autoMode.reviewerModel` | 未设置 | 审查自动模式调用的模型。 |
-| `autoMode.gate` | `"side-effect"` | 设置为 `"all"` 后审查所有工具调用。 |
-| `autoMode.timeoutMs` | `30000` | 审查超时时间，单位为毫秒。 |
-
-## 本地存储与上下文诊断
-
-本地 Context 数据位于 `~/.pi/agent/extensions/pi-openai-toolkit/context-management/`：
-
-- `sessions/<root-session-key>/agents/root/notes/` 保存主代理 Notes；子代理使用 `agents/root/<agent-id>/notes/`。`<root-session-key>` 是根 Pi session ID 的 SHA-256，与项目路径无关。
-- 相对路径 `state.md` 指当前代理的笔记；虚拟绝对路径 `/root/<agent-id>/notes/state.md` 可跨代理读写，但始终限定同一根 session。省略列表/搜索前缀时只查当前代理。
-- `sessions/<root-session-key>/sources/` 记录显式注册的 session 来源；`history.sqlite` 索引这些来源的历史。持久化 Pi JSONL 是可重建来源，不扫描整个项目或全局会话目录。SDK 内存会话可即时读取，关闭时尽力保存索引快照，但其历史不能保证在索引重建后恢复。
-- `history` 默认查询当前代理，`agent_name` 可用绝对路径或当前代理下的相对路径；所有操作（包括 `read_item`）均遵守该范围。`search_contents` 保持大小写敏感的字面子串匹配。
-- 旧 `notes/<project-key>/` 和 `history/<project-key>.sqlite` **保留原样，不读取、不自动迁移、不删除**。如需带入旧笔记，应核对目标任务后显式复制。普通 `/new`、`/fork` 是新范围；恢复同一 session 则继续原范围。
-- `status/<project-key>/<session-key>/latest.json` 是每个 session 的 best-effort 最新状态，采用原子替换，大小上限为 16 KiB，文件权限为 `0600`（目录 `0700`），不会按 turn 无限增长。
-
-诊断用的项目 identity 仍按 Git common directory（失败时 canonical cwd）计算，但不再用于 Notes/History 的访问范围。状态中包含 backend 与 active、哈希后的项目 identity kind/key、窗口 id/number 与 initialized/restored、剩余预算和已配置提醒阈值、reminder/fallback 状态、成功 Notes checkpoint 的大小（可获得时）、rollover 结果以及恢复状态。`get_context_remaining` 保持原有首句和 token 字段不变，并在 `details.status` 中返回这些状态。
-
-状态采集只在本地进行，绝不写入 Notes 正文、prompt、凭证、encrypted output 或 cwd/session 文件路径。所有写入都是 best-effort；observer 失败不会阻断请求或上下文切换。启用 `compaction.debug: true` 后，同样不含正文的状态转换也会写入详细 lifecycle artifact；这些生命周期事件不包含 Notes 或 prompt 正文。provider payload artifact 仍由单独的显式 payload 日志选项控制。
+完整字段和默认值见[配置参考](docs/configuration.md)与 [JSON Schema](config.schema.json)。协议、检查点和调试细节见[内部实现](docs/internals.md)。
 
 ## 开发
 
-在仓库根目录安装依赖后运行：
+在仓库根目录运行：
 
 ```bash
-npm run typecheck    # 类型检查
-bun test             # 运行测试
-npm run test:pi      # 运行 Pi 冒烟测试
-npm pack --dry-run   # 检查发布包内容
+npm ci
+npm run typecheck
+npm test
+npm run test:pi
+npm pack --dry-run
 ```
 
-## 许可证
+测试使用 Bun，已列入开发依赖。修改 README 的 JSON 示例时，同步更新中英文版本，文档测试会检查两者一致。
 
-MIT © awoaCrim 与贡献者。见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+MIT © awoaCrim 与贡献者。许可证见 [LICENSE](LICENSE)，第三方来源与致谢见 [NOTICE](NOTICE)。

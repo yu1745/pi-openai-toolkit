@@ -1,4 +1,5 @@
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
+import { LOCAL_WEB_SEARCH_TOOL_NAME, WEB_RUN_TOOL_NAME } from "./web-search/types";
 
 /**
  * Explicit allowlist of fields mirrored from the latest live Responses request.
@@ -30,10 +31,21 @@ type CachedRequestContext = {
 	extras: CompactionRequestExtras;
 };
 
+export type RequestContextCaptureOptions = {
+	/** Standalone Web Search is a local tool and must not enter synthetic compact requests. */
+	excludeWebSearchTools?: boolean;
+};
+
 let cached: CachedRequestContext | undefined;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isWebSearchTool(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	if (value.type === "web_search" || value.type === "web_search_preview") return true;
+	return value.type === "function" && (value.name === LOCAL_WEB_SEARCH_TOOL_NAME || value.name === WEB_RUN_TOOL_NAME);
 }
 
 function sameIdentity(cachedIdentity: RequestContextIdentity, current: RequestContextIdentity): boolean {
@@ -54,6 +66,7 @@ function sameIdentity(cachedIdentity: RequestContextIdentity, current: RequestCo
 export function rememberRequestContext(
 	payload: ResponsesCompatibleRequestPayload,
 	identity: RequestContextIdentity,
+	options: RequestContextCaptureOptions = {},
 ): void {
 	try {
 		if (payload.model !== identity.model) {
@@ -63,7 +76,10 @@ export function rememberRequestContext(
 
 		const extras: CompactionRequestExtras = {};
 		if (Array.isArray(payload.tools)) {
-			extras.tools = structuredClone(payload.tools);
+			const tools = options.excludeWebSearchTools
+				? payload.tools.filter((tool) => !isWebSearchTool(tool))
+				: payload.tools;
+			extras.tools = structuredClone(tools);
 		}
 		if (typeof payload.parallel_tool_calls === "boolean") {
 			extras.parallel_tool_calls = payload.parallel_tool_calls;

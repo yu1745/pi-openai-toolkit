@@ -2,24 +2,35 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { executeHistoryNotesTool, type CodexHistoryNotesDetails } from "./history-notes";
 import { type CodexContextWindowManager } from "./window-manager";
-import type { ContextStatusDetails } from "./context-observer";
 import {
 	HISTORY_ACTION_FIELDS,
 	HISTORY_ENDPOINTS,
 	NOTES_ACTION_FIELDS,
 	NOTES_ENDPOINTS,
 } from "./history-notes";
-import type { HistoryAction, NotesAction } from "./types";
+import type { ContextWindowIdentity, HistoryAction, NotesAction } from "./types";
 
 const EMPTY_PARAMETERS = Type.Object({}, { additionalProperties: false });
 
-function arrayEquals(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
-	if (a === b) return true;
-	if (!a || !b || a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) {
-		if (a[i] !== b[i]) return false;
-	}
-	return true;
+type PublishedTool = {
+	name: string;
+	description: string;
+	parameters: unknown;
+	promptGuidelines?: string[];
+};
+
+/**
+ * Pi's ToolInfo wrapper is new, but its definition fields retain the objects
+ * registered by the extension. Keep identity checks for those fields: an exact
+ * foreign clone under the same name is still not ownership of our tool.
+ */
+function isOurTool(
+	actual: PublishedTool,
+	expected: { description: string; parameters: unknown; promptGuidelines?: string[] },
+): boolean {
+	return actual.description === expected.description
+		&& actual.parameters === expected.parameters
+		&& actual.promptGuidelines === expected.promptGuidelines;
 }
 const HISTORY_ACTIONS = Object.keys(HISTORY_ENDPOINTS) as [HistoryAction, ...HistoryAction[]];
 const NOTES_ACTIONS = Object.keys(NOTES_ENDPOINTS) as [NotesAction, ...NotesAction[]];
@@ -59,22 +70,22 @@ export const NOTES_PARAMETERS = Type.Object({
 
 export interface NewContextDetails { started: boolean; }
 
-export const NEW_CONTEXT_PARAMETERS = Type.Object({
-	force: Type.Optional(Type.Boolean({
-	description: "Roll over even without a successful notes checkpoint in this window. Discards unsaved working state.",
-})),
-}, { additionalProperties: false });
+export const NEW_CONTEXT_PARAMETERS = Type.Object({}, { additionalProperties: false });
 
 export const NEW_CONTEXT_CHECKPOINT_REQUIRED_MESSAGE =
-	"new_context refused: no successful notes checkpoint in this window. "
-	+ "Save the active request, decisions, progress and next steps with notes append_to_file or write_file, then retry. "
-	+ "Pass force=true only when the user explicitly accepts losing unsaved working state.";
+	"new_context refused: no persisted successful notes checkpoint in the current context window. "
+	+ "Write the active request, decisions, progress and next steps with notes append_to_file or write_file, "
+	+ "wait until that notes result is persisted, then retry new_context in a later tool turn. "
+	+ "Do not pass force arguments and do not repeat new_context while a rollover is already scheduled.";
+
+export const NEW_CONTEXT_COOLDOWN_MESSAGE =
+	"new_context refused: this window was entered by a context switch and has not run any substantive "
+	+ "tool yet. Read the checkpoint receipt with notes read_file, continue the active task with real "
+	+ "tools, and call new_context only once this window has produced tool activity.";
 export interface ContextRemainingDetails {
 	remainingTokens?: number;
 	windowId?: string;
 	contextWindow: number;
-	/** Additive observability fields; the legacy token fields above remain unchanged. */
-	status: ContextStatusDetails;
 }
 
 export type ContextManagementTools = {
@@ -84,62 +95,98 @@ export type ContextManagementTools = {
 	notes: ToolDefinition<typeof NOTES_PARAMETERS, CodexHistoryNotesDetails>;
 };
 
+export type ContextOperationPolicy = { active: boolean; gatewayModels: readonly string[] };
+type ContextActivity = (ctx: ExtensionContext) => Promise<boolean | ContextOperationPolicy> | boolean | ContextOperationPolicy;
+
+export interface ContextRolloverHandoff {
+	prepare(ctx: ExtensionContext): { triggerTurn: false; beforeSchedule: (identity: ContextWindowIdentity) => void } | undefined;
+}
+
 export function createContextManagementTools(
 	pi: ExtensionAPI,
 	manager: CodexContextWindowManager,
-	isActive: (ctx: ExtensionContext) => Promise<boolean> | boolean,
+	isActive: ContextActivity,
 	getGatewayModels: () => readonly string[] = () => [],
-	getBackend: (ctx: ExtensionContext) => "remote" | "local" = () => "local",
+	handoff?: ContextRolloverHandoff,
 ): ContextManagementTools {
-	const assertActive = async (ctx: ExtensionContext): Promise<void> => {
-		if (!(await isActive(ctx))) throw new Error("local-context-inactive");
+	const assertActive = async (ctx: ExtensionContext): Promise<readonly string[]> => {
+		const policy = await isActive(ctx);
+		if (!(typeof policy === "boolean" ? policy : policy.active)) throw new Error("remote-context-inactive");
+		return typeof policy === "boolean" ? getGatewayModels() : policy.gatewayModels;
 	};
 	const newContext: ToolDefinition<typeof NEW_CONTEXT_PARAMETERS, NewContextDetails> = {
 		name: "new_context",
 		label: "new_context",
-		description: "Start a new context window without generating a conversation summary. Requires a successful notes checkpoint in the current window unless force is set.",
+		description: "Start a new remote Codex context window without generating a conversation summary. Requires a persisted successful notes checkpoint in the current window.",
 		parameters: NEW_CONTEXT_PARAMETERS,
-		promptSnippet: "Start a new context window without summarizing history.",
-		promptGuidelines: ["Checkpoint active work in notes before calling new_context; no conversation summary carries over. A successful notes append/write in this window is required unless the user explicitly accepts discarding unsaved state (force=true)."],
+		exposure: "direct",
+		promptSnippet: "Start a new remote Codex context window without summarizing history.",
+		promptGuidelines: [
+			"Before this new_context call, checkpoint active work in notes; only a persisted successful notes append/write in the current window unlocks this rollover, and no conversation summary carries over.",
+			"A successful new_context completes one context switch. In the next window, read the checkpoint receipt first when present, then resume the active user task; do not immediately create another checkpoint or call new_context as part of that handoff.",
+			"Wait for the notes tool result before calling new_context; an in-flight or failed write is not a checkpoint. If new_context reports that a rollover is already scheduled, do not call it again in the same window.",
+		],
 		executionMode: "sequential",
-		async execute(_id, params, signal, _update, ctx) {
-			await assertActive(ctx);
-			manager.recordRolloverRequested(ctx);
-			if (!params.force && !manager.hasNotesCheckpointSinceBoundary(ctx)) {
-				manager.recordRolloverRefused(ctx, "notes-checkpoint-required");
+		async execute(_id, _params, signal, _update, ctx) {
+			const gatewayModels = await assertActive(ctx);
+			manager.synchronize(ctx);
+			if (manager.hasPendingRollover(ctx)) {
+				return {
+					content: [{ type: "text", text: "A new context window is already scheduled." }],
+					details: { started: false },
+				};
+			}
+			if (!manager.canRolloverFromCurrentWindow(ctx)) {
+				return {
+					content: [{ type: "text", text: NEW_CONTEXT_COOLDOWN_MESSAGE }],
+					details: { started: false },
+				};
+			}
+			if (!manager.hasNotesCheckpointSinceBoundary(ctx)) {
 				throw new Error(NEW_CONTEXT_CHECKPOINT_REQUIRED_MESSAGE);
 			}
+			const scheduling = handoff?.prepare(ctx);
 			const started = await manager.startNewWindow(pi, ctx, {
 				triggerTurn: true,
 				signal,
 				trimPreviousWindow: true,
+				gatewayModels,
+				...scheduling,
 			});
 			return {
-				content: [{ type: "text", text: started ? "A new context window will start without summarizing conversation history." : "A new context window is already scheduled." }],
+				content: [{
+					type: "text",
+					text: started
+						? "Context switch scheduled successfully. In the next context window, read the checkpoint receipt first when present, then resume the active user task; do not immediately create another checkpoint or call new_context."
+						: "A new context window is already scheduled.",
+				}],
 				details: { started },
+				...(started && scheduling ? { terminate: true } : {}),
 			};
 		},
 	};
 	const getContextRemaining: ToolDefinition<typeof EMPTY_PARAMETERS, ContextRemainingDetails> = {
 		name: "get_context_remaining",
 		label: "get_context_remaining",
-		description: "Get the remaining tokens in the current context window.",
+		description: "Get the remaining tokens in the current remote Codex context window.",
 		parameters: EMPTY_PARAMETERS,
+		exposure: "direct",
 		async execute(_id, _params, _signal, _update, ctx) {
 			await assertActive(ctx);
 			const remaining = manager.remaining(ctx);
 			return {
 				content: [{ type: "text", text: remaining.remainingTokens === undefined ? "You have unknown tokens left in this context window." : `You have ${remaining.remainingTokens} tokens left in this context window.` }],
-				details: { ...remaining, status: manager.contextStatus(ctx) },
+				details: remaining,
 			};
 		},
 	};
 	const history: ToolDefinition<typeof HISTORY_PARAMETERS, CodexHistoryNotesDetails> = {
 		name: "history",
 		label: "history",
-		description: "Search or read prior context-window history. Pass IDs unchanged.",
+		description: "Search or read prior remote Codex context-window history. Pass IDs unchanged.",
 		parameters: HISTORY_PARAMETERS,
-		promptSnippet: "Search or read prior context-window history; default to the current agent.",
+		exposure: "direct",
+		promptSnippet: "Search or read prior remote Codex context-window history.",
 		promptGuidelines: [
 			"When the user asks about decisions, code, or details from earlier in the conversation that are no longer in the current context window, use history first instead of relying on fragments that survived compaction.",
 			"Use read_item with the exact item_id returned by list_items or search_contents; never rewrite, truncate, or guess IDs.",
@@ -148,18 +195,20 @@ export function createContextManagementTools(
 			"History is read-only; make no edits through it. Edits and durable checkpoints belong to notes.",
 		],
 		execute: async (_id, params, _signal, _update, ctx) => {
-			await assertActive(ctx);
-			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels(), getBackend(ctx));
+			const gatewayModels = await assertActive(ctx);
+			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels);
 		},
 	};
 	const notes: ToolDefinition<typeof NOTES_PARAMETERS, CodexHistoryNotesDetails> = {
 		name: "notes",
 		label: "notes",
-		description: "Read and checkpoint notes across context windows.",
+		description: "Read and checkpoint remote Codex notes across context windows.",
 		parameters: NOTES_PARAMETERS,
-		promptSnippet: "Read and checkpoint agent-scoped notes across context windows within this task.",
+		exposure: "direct",
+		promptSnippet: "Read and checkpoint remote Codex notes across context windows.",
 		promptGuidelines: [
-			"Before calling new_context, checkpoint the current turn's active work (unfinished tasks, decisions, open questions, references) into notes with append_to_file or write_file so it survives the window change.",
+			"Before calling new_context, checkpoint the current turn's active work (unfinished tasks, decisions, open questions, references) into notes with append_to_file or write_file so it survives the window change; wait for that result to be persisted before calling new_context.",
+			"After a successful new_context handoff, read the checkpoint receipt first when present and resume the active user task; do not immediately create another checkpoint or call new_context unless a later rollover is actually needed.",
 			"When a large task spans multiple context windows, keep a running note per line of work and read it at the start of each new window; append new state instead of replacing it unless the note is stale.",
 			"Prefer read_file or search_contents for looking things up; reserve write_file for explicit rewrite/clear and append_to_file for incremental state.",
 			"Keep note text concise and self-contained: it may be read later without the rest of the conversation, so include identifiers and verbatim key decisions, not hearsay summaries.",
@@ -167,23 +216,19 @@ export function createContextManagementTools(
 		],
 		executionMode: "sequential",
 		execute: async (_id, params, _signal, _update, ctx) => {
-			await assertActive(ctx);
-			const result = await executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, getGatewayModels(), getBackend(ctx));
-			if (params.action === "append_to_file" || params.action === "write_file") {
-				const value = result.details.contextManagement;
-				const file = value.file && typeof value.file === "object" && !Array.isArray(value.file)
-					? value.file as Record<string, unknown>
-					: undefined;
-				const sizeBytes = typeof file?.size_bytes === "number" && Number.isFinite(file.size_bytes)
-					? file.size_bytes
-					: undefined;
-				manager.recordNotesCheckpoint(ctx, sizeBytes);
-			}
-			return result;
+			const gatewayModels = await assertActive(ctx);
+			return executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels);
 		},
 	};
 	return { newContext, getContextRemaining, history, notes };
 }
+
+export type ContextToolRegistrationState = "verified" | "excluded" | "conflict" | "unverified";
+
+export type ContextToolSyncResult = {
+	synced: boolean;
+	registrationState: ContextToolRegistrationState;
+};
 
 export class ContextManagementToolController {
 	private readonly registeredNames = new Set<string>();
@@ -192,12 +237,8 @@ export class ContextManagementToolController {
 		parameters: unknown;
 		promptGuidelines?: string[];
 	}>();
-	private readonly ownedNames = new Set<string>();
-	private readonly baselineNames = new Set<string>();
 	private registered = false;
-	private registrationChecked = false;
-	private registrationValid = false;
-	private baselineCaptured = false;
+	private verifiedOnce = false;
 
 	constructor(private readonly pi: ExtensionAPI) {}
 
@@ -211,12 +252,16 @@ export class ContextManagementToolController {
 		// those are bound only after extension loading completes.
 		try {
 			for (const definition of definitions) api.registerTool(definition);
+			this.registered = true;
 		} catch {
+			// Pi rejects a registration whose name is already owned elsewhere.
+			this.registered = false;
 			return false;
 		}
 
 		this.registeredNames.clear();
 		this.definitions.clear();
+		this.verifiedOnce = false;
 		for (const definition of definitions) {
 			this.registeredNames.add(definition.name);
 			this.definitions.set(definition.name, {
@@ -225,97 +270,94 @@ export class ContextManagementToolController {
 				promptGuidelines: definition.promptGuidelines,
 			});
 		}
-		this.registered = true;
-		this.registrationChecked = false;
-		this.registrationValid = false;
+		// A successful call only proves the hand-off; it does not prove the runtime
+		// published the definitions. `checkRegistration()` reads that from Pi.
 		return true;
 	}
 
-	private verifyRegistration(): boolean {
-		if (!this.registered) return false;
-		if (this.registrationChecked) return this.registrationValid;
-		this.registrationChecked = true;
+	/**
+	 * Read registration state until the runtime confirms publication.
+	 *
+	 * Pi 0.86 can reject action methods while a session replacement is still
+	 * binding, and can publish the registry after `session_start` ran. Negative
+	 * reads remain retryable; only a successful verification is cached for this
+	 * controller instance. A Pi reload creates a new controller.
+	 */
+	checkRegistration(): ContextToolRegistrationState {
+		if (!this.registered) return "conflict";
+		// A confirmed publication is kept: the expensive part was never the read, it
+		// was trusting a failed one. Only negative verdicts are recomputed each time.
+		if (this.verifiedOnce) return "verified";
+		let available: PublishedTool[];
 		try {
-			const api = this.pi as ExtensionAPI & { getAllTools?: () => Array<{
-				name: string;
-				description: string;
-				parameters: unknown;
-				promptGuidelines?: string[];
-			}> };
-			if (typeof api.getAllTools !== "function") return false;
-			const available = new Map(api.getAllTools().map((tool) => [tool.name, tool]));
-			this.registrationValid = [...this.registeredNames].every((name) => {
-				const actual = available.get(name);
-				const expected = this.definitions.get(name);
-				return actual !== undefined && expected !== undefined &&
-					actual.description === expected.description &&
-					actual.parameters === expected.parameters &&
-					actual.promptGuidelines === expected.promptGuidelines;
-			});
+			const api = this.pi as ExtensionAPI & { getAllTools?: () => PublishedTool[] };
+			if (typeof api.getAllTools !== "function") return "conflict";
+			available = api.getAllTools();
 		} catch {
-			this.registrationValid = false;
+			// Stale or unbound runtime: retry on the next sync.
+			return "unverified";
 		}
-		if (!this.registrationValid) this.ownedNames.clear();
-		return this.registrationValid;
+		const byName = new Map(available.map((tool) => [tool.name, tool]));
+		let missing = false;
+		let conflict = false;
+		let published = 0;
+		for (const name of this.registeredNames) {
+			const actual = byName.get(name);
+			const expected = this.definitions.get(name);
+			if (actual === undefined || expected === undefined) {
+				missing = true;
+				continue;
+			}
+			published += 1;
+			if (!isOurTool(actual, expected)) conflict = true;
+		}
+		if (conflict) return "conflict";
+		// A readable registry with no Toolkit-owned definitions is the positive
+		// host-filtering signal used by --no-tools/restricted child sessions.
+		if (published === 0) return "excluded";
+		if (missing) return "unverified";
+		this.verifiedOnce = true;
+		return "verified";
 	}
 
-	private captureBaseline(): boolean {
-		if (this.baselineCaptured) return true;
-		try {
-			const api = this.pi as ExtensionAPI & { getActiveTools?: () => string[] };
-			if (typeof api.getActiveTools !== "function") return false;
-			this.baselineNames.clear();
-			for (const name of api.getActiveTools()) this.baselineNames.add(name);
-			this.baselineCaptured = true;
-			return true;
-		} catch {
-			return false;
-		}
-	}
-
-	sync(active: boolean): boolean {
-		if (!this.verifyRegistration() || !this.captureBaseline()) return false;
+	sync(active: boolean): ContextToolSyncResult {
+		const registrationState = this.checkRegistration();
+		if (registrationState !== "verified") return { synced: false, registrationState };
 		const api = this.pi as ExtensionAPI & { getActiveTools?: () => string[]; setActiveTools?: (names: string[]) => void };
-		if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") return false;
+		if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") {
+			return { synced: false, registrationState };
+		}
 		try {
 			const current = api.getActiveTools();
-			if (active) {
-				const next = [...current];
-				for (const name of this.registeredNames) {
-					if (!next.includes(name) && !this.baselineNames.has(name)) {
-						next.push(name);
-						this.ownedNames.add(name);
-					}
-				}
-				if (next.length !== current.length) api.setActiveTools(next);
-				return true;
-			}
-			const next = current.filter((name) => !this.ownedNames.has(name));
+			// Pi may activate a newly registered tool before the first sync. Once
+			// registration is verified, every registered name belongs to this
+			// controller: active models get all four, inactive models get none.
+			const next = active
+				? [...current, ...[...this.registeredNames].filter((name) => !current.includes(name))]
+				: current.filter((name) => !this.registeredNames.has(name));
 			if (next.length !== current.length) api.setActiveTools(next);
-			this.ownedNames.clear();
-			return true;
+			return { synced: true, registrationState };
 		} catch {
-			return false;
+			return { synced: false, registrationState };
 		}
 	}
 
 	reset(): void {
 		this.sync(false);
-		this.baselineNames.clear();
-		this.baselineCaptured = false;
 	}
-	get isRegistered(): boolean { return this.registrationValid; }
+	get isRegistered(): boolean { return this.checkRegistration() === "verified"; }
+	get registrationState(): ContextToolRegistrationState { return this.checkRegistration(); }
 }
 
 export function registerContextManagementTools(
 	pi: ExtensionAPI,
 	manager: CodexContextWindowManager,
-	isActive: (ctx: ExtensionContext) => Promise<boolean> | boolean,
+	isActive: ContextActivity,
 	getGatewayModels?: () => readonly string[],
-	getBackend?: (ctx: ExtensionContext) => "remote" | "local",
+	handoff?: ContextRolloverHandoff,
 ): ContextManagementToolController {
 	const controller = new ContextManagementToolController(pi);
-	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels, getBackend));
+	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels, handoff));
 	return controller;
 }
 

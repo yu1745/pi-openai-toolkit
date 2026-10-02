@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ToolCall } from "@earendil-works/pi-ai";
 import { parseReviewVerdict, requestToolReview, type EvidenceTool, type ReviewerRegistry } from "./reviewer";
 import { buildReviewPrompt, reviewerSystemPrompt } from "./prompt";
 import { MAX_REVIEW_INPUT_CHARS, MAX_REVIEW_REASON_CHARS } from "./types";
@@ -35,7 +35,11 @@ function assistantMessage(
 	} as AssistantMessage;
 }
 
-function toolCall(name: string, args: Record<string, unknown>, id = `tc-${Math.random().toString(36).slice(2)}`) {
+function toolCall(
+	name: string,
+	args: ToolCall["arguments"],
+	id = `tc-${Math.random().toString(36).slice(2)}`,
+): ToolCall {
 	return { type: "toolCall", id, name, arguments: args };
 }
 
@@ -266,6 +270,55 @@ describe("requestToolReview", () => {
 });
 
 describe("requestToolReview evidence loop", () => {
+	test("deadline stops noncooperative evidence and prevents subsequent calls", async () => {
+		let evidenceSignal: AbortSignal | undefined;
+		let providerSignal: AbortSignal | undefined;
+		let rejectLate!: (error: Error) => void;
+		const pending = new Promise<string>((_resolve, reject) => { rejectLate = reject; });
+		let executions = 0;
+		const tool: EvidenceTool = {
+			...readOnlyTool("read", ""),
+			execute: async (_args, signal) => { executions++; evidenceSignal = signal; return pending; },
+		};
+		const h = createRegistry((_call, options) => {
+			providerSignal = options?.signal;
+			return assistantMessage([toolCall("read", {}), toolCall("read", {})]);
+		});
+		const result = await review(h.registry, { evidenceTools: [tool], maxEvidenceRounds: 3, timeoutMs: 15 });
+		expect(result).toMatchObject({ kind: "unavailable", cause: "timeout" });
+		expect(executions).toBe(1);
+		expect(h.calls).toBe(1);
+		expect(evidenceSignal).toBe(providerSignal);
+		expect(evidenceSignal?.aborted).toBe(true);
+		rejectLate(new Error("late evidence rejection"));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}, 1000);
+
+	test("caller cancellation settles noncooperative evidence without a risk verdict", async () => {
+		const controller = new AbortController();
+		let executions = 0;
+		const tool: EvidenceTool = {
+			...readOnlyTool("read", ""),
+			execute: async () => {
+				executions++;
+				controller.abort();
+				return new Promise<string>(() => {});
+			},
+		};
+		const h = createRegistry(assistantMessage([toolCall("read", {}), toolCall("read", {})]));
+		expect(await review(h.registry, { evidenceTools: [tool], maxEvidenceRounds: 2, signal: controller.signal })).toMatchObject({ kind: "unavailable", cause: "cancelled" });
+		expect(executions).toBe(1);
+		expect(h.calls).toBe(1);
+	}, 1000);
+
+	test("a noncooperative provider is bounded and an expired review starts no work", async () => {
+		const h = createRegistry(() => new Promise<AssistantMessage>(() => {}));
+		expect(await review(h.registry, { timeoutMs: 15 })).toMatchObject({ kind: "unavailable", cause: "timeout" });
+		expect(h.calls).toBe(1);
+		expect(await review(h.registry, { timeoutMs: 0 })).toMatchObject({ kind: "unavailable", cause: "timeout" });
+		expect(h.calls).toBe(1);
+	}, 1000);
+
 	test("executes a read-only tool call and feeds the result back before deciding", async () => {
 		const tool = readOnlyTool("read", "the script only prints a version");
 		const harness = createRegistry((call) =>
@@ -281,6 +334,7 @@ describe("requestToolReview evidence loop", () => {
 
 		expect(outcome).toMatchObject({ kind: "allow", evidenceRounds: 1 });
 		expect(tool.invocations).toHaveLength(1);
+		expect(tool.invocations[0]?.[0]).toEqual({ path: "deploy.sh" });
 		expect(harness.calls).toBe(2);
 
 		const second = harness.contexts[1] as { messages: Array<{ role: string; content?: unknown }> };

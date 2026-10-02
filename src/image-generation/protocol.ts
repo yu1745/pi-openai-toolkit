@@ -1,9 +1,10 @@
 import { DEFAULT_IMAGE_GENERATION_MODELS } from "../types";
 import {
-	IMAGE_GENERATION_MIME_TYPE,
+	IMAGE_GENERATION_MIME_TYPES,
 	IMAGE_GENERATION_QUALITIES,
 	IMAGE_GENERATION_SIZES,
 	MAX_GENERATED_IMAGE_BYTES,
+	MAX_IMAGE_BATCH_SIZE,
 	MAX_IMAGE_DIAGNOSTIC_CHARS,
 	MAX_IMAGE_DIMENSION,
 	MAX_IMAGE_IDENTIFIER_CHARS,
@@ -14,6 +15,7 @@ import {
 	ImageGenerationError,
 	sanitizeImageDiagnostic,
 	type GenerateImageParams,
+	type ImageGenerationMimeType,
 	type NormalizedGenerateImageParams,
 	type ParsedGeneratedImage,
 	type PreparedReferenceImage,
@@ -26,26 +28,13 @@ const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/
 const DATA_URL_PATTERN = /^data:image\/[a-z0-9.+-]+;base64,(.*)$/is;
 
 export type ImageGenerationRequestBody = {
+	action: NormalizedGenerateImageParams["action"];
 	model: string;
-	store: false;
-	stream: false;
-	parallel_tool_calls: false;
-	input: Array<{
-		role: "user";
-		content: Array<
-			| { type: "input_text"; text: string }
-			| { type: "input_image"; image_url: string; detail: "auto" }
-		>;
-	}>;
-	tools: Array<{
-		type: "image_generation";
-		model: string;
-		action: "generate" | "edit";
-		size: NormalizedGenerateImageParams["size"];
-		quality: NormalizedGenerateImageParams["quality"];
-		output_format: "png";
-	}>;
-	tool_choice: { type: "image_generation" };
+	prompt: string;
+	n: 1;
+	size: NormalizedGenerateImageParams["size"];
+	quality: NormalizedGenerateImageParams["quality"];
+	references: readonly PreparedReferenceImage[];
 };
 
 export type ParsedImageResponseResult =
@@ -137,6 +126,22 @@ function normalizeRequestedModel(value: unknown): string | undefined {
 	return trimmed;
 }
 
+function normalizeBatchSize(value: unknown): number {
+	if (value === null || value === undefined) return 1;
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < 1 ||
+		value > MAX_IMAGE_BATCH_SIZE
+	) {
+		throw new ImageGenerationError(
+			"invalid-parameters",
+			`batchSize must be an integer from 1 to ${MAX_IMAGE_BATCH_SIZE}.`,
+		);
+	}
+	return value;
+}
+
 /**
  * Configured model ids are only trusted as far as the shared bounds: unusable entries are
  * dropped, and an empty or malformed list falls back to the shipped default model.
@@ -153,9 +158,9 @@ function usableImageModels(models: readonly string[] | undefined): string[] {
 }
 
 /**
- * Resolve the nested `image_generation` model for one call. An omitted request selects the
- * first configured model so configuration order expresses the default; an explicit request must
- * match a configured id exactly, and it fails here — before any paid dispatch.
+ * Resolve the independent Images API model for one call. An omitted request selects the
+ * explicit default when supplied (v2), or the first configured model for legacy callers.
+ * An explicit request must match a configured id exactly before any paid dispatch.
  */
 function formatAvailableImageModels(models: readonly string[]): string {
 	const visible = models.slice(0, MAX_DISPLAYED_IMAGE_MODELS_IN_ERROR);
@@ -166,15 +171,21 @@ function formatAvailableImageModels(models: readonly string[]): string {
 export function selectImageGenerationModel(args: {
 	requestedModel?: string;
 	configuredModels?: readonly string[];
+	defaultModel?: string;
 }): string {
 	const models = usableImageModels(args.configuredModels);
+	if (args.defaultModel !== undefined && (!args.configuredModels?.length ||
+		!args.configuredModels.every((model) => typeof model === "string" && model.trim().length > 0 && model.trim().length <= MAX_IMAGE_MODEL_ID_CHARS) ||
+		!models.includes(args.defaultModel))) {
+		throw new ImageGenerationError("invalid-parameters", "The configured default image model must be in the nonempty allowedModels list.");
+	}
 	const requested = typeof args.requestedModel === "string" ? args.requestedModel.trim() : "";
-	if (!requested) return models[0]!;
+	if (!requested) return args.defaultModel ?? models[0]!;
 	if (models.includes(requested)) return requested;
 	throw new ImageGenerationError(
 		"invalid-parameters",
 		`Unknown image generation model "${requested.slice(0, MAX_IMAGE_MODEL_ID_CHARS)}". ` +
-			`Configure it in imageGeneration.models first; available models: ${formatAvailableImageModels(models)}.`,
+			`Configure it in imageGeneration.allowedModels (legacy: imageGeneration.models) first; available models: ${formatAvailableImageModels(models)}.`,
 	);
 }
 
@@ -207,6 +218,13 @@ export function normalizeGenerateImageParams(
 
 	const referenceImagePaths = normalizePathList(params.referenceImagePaths);
 	const outputPath = normalizeOutputPath(params.outputPath);
+	const batchSize = normalizeBatchSize(params.batchSize);
+	if (batchSize > 1 && outputPath !== undefined) {
+		throw new ImageGenerationError(
+			"invalid-parameters",
+			"outputPath cannot be used when batchSize is greater than 1; use the generated artifacts instead.",
+		);
+	}
 
 	return {
 		prompt,
@@ -215,12 +233,12 @@ export function normalizeGenerateImageParams(
 		size,
 		quality,
 		model: normalizeRequestedModel(params.model),
+		batchSize,
 		action: referenceImagePaths.length > 0 ? "edit" : "generate",
 	};
 }
 
 export function buildImageGenerationRequest(args: {
-	routingModel: string;
 	imageModel: string;
 	params: NormalizedGenerateImageParams;
 	references: readonly PreparedReferenceImage[];
@@ -232,34 +250,14 @@ export function buildImageGenerationRequest(args: {
 			"A configured image generation model is required.",
 		);
 	}
-	const content: ImageGenerationRequestBody["input"][number]["content"] = [
-		{ type: "input_text", text: args.params.prompt },
-	];
-	for (const reference of args.references) {
-		content.push({
-			type: "input_image",
-			image_url: `data:${reference.mimeType};base64,${reference.bytes.toString("base64")}`,
-			detail: "auto",
-		});
-	}
-
 	return {
-		model: args.routingModel,
-		store: false,
-		stream: false,
-		parallel_tool_calls: false,
-		input: [{ role: "user", content }],
-		tools: [
-			{
-				type: "image_generation",
-				model: imageModel,
-				action: args.params.action,
-				size: args.params.size,
-				quality: args.params.quality,
-				output_format: "png",
-			},
-		],
-		tool_choice: { type: "image_generation" },
+		action: args.params.action,
+		model: imageModel,
+		prompt: args.params.prompt,
+		n: 1,
+		size: args.params.size,
+		quality: args.params.quality,
+		references: args.references,
 	};
 }
 
@@ -272,35 +270,7 @@ function hasPngEndChunk(buffer: Buffer): boolean {
 }
 
 export function detectReferenceImageMimeType(bytes: Uint8Array): ReferenceImageMimeType | undefined {
-	const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	if (readPngDimensions(buffer) && hasPngEndChunk(buffer)) return "image/png";
-	if (
-		buffer.length >= 4 &&
-		buffer[0] === 0xff &&
-		buffer[1] === 0xd8 &&
-		buffer[2] === 0xff &&
-		buffer.lastIndexOf(Buffer.from([0xff, 0xd9])) >= 3
-	) {
-		return "image/jpeg";
-	}
-	if (
-		buffer.length >= 20 &&
-		buffer.toString("ascii", 0, 4) === "RIFF" &&
-		buffer.toString("ascii", 8, 12) === "WEBP"
-	) {
-		const declaredSize = buffer.readUInt32LE(4) + 8;
-		const chunkType = buffer.toString("ascii", 12, 16);
-		const chunkSize = buffer.readUInt32LE(16);
-		const paddedChunkSize = chunkSize + (chunkSize % 2);
-		if (
-			declaredSize === buffer.length &&
-			(chunkType === "VP8 " || chunkType === "VP8L" || chunkType === "VP8X") &&
-			20 + paddedChunkSize <= buffer.length
-		) {
-			return "image/webp";
-		}
-	}
-	return undefined;
+	return readImageMetadata(bytes)?.mimeType;
 }
 
 export function isValidPng(bytes: Uint8Array): boolean {
@@ -322,14 +292,145 @@ export function readPngDimensions(bytes: Uint8Array): { width: number; height: n
 	return { width, height };
 }
 
+function boundedDimensions(width: number, height: number): { width: number; height: number } | undefined {
+	if (
+		!Number.isInteger(width) ||
+		!Number.isInteger(height) ||
+		width <= 0 ||
+		height <= 0 ||
+		width > MAX_IMAGE_DIMENSION ||
+		height > MAX_IMAGE_DIMENSION
+	) {
+		return undefined;
+	}
+	return { width, height };
+}
+
+const JPEG_DIMENSION_MARKERS = new Set([
+	0xc0,
+	0xc1,
+	0xc2,
+	0xc3,
+	0xc5,
+	0xc6,
+	0xc7,
+	0xc9,
+	0xca,
+	0xcb,
+	0xcd,
+	0xce,
+	0xcf,
+]);
+
+function readJpegDimensions(bytes: Uint8Array): { width: number; height: number } | undefined {
+	const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return undefined;
+	let offset = 2;
+	while (offset < buffer.length) {
+		if (buffer[offset] !== 0xff) {
+			offset += 1;
+			continue;
+		}
+		while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+		if (offset >= buffer.length) return undefined;
+		const marker = buffer[offset++];
+		if (marker === 0xd9 || marker === 0xda) return undefined;
+		if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+		if (offset + 2 > buffer.length) return undefined;
+		const segmentLength = buffer.readUInt16BE(offset);
+		if (segmentLength < 2 || offset + segmentLength > buffer.length) return undefined;
+		if (JPEG_DIMENSION_MARKERS.has(marker) && segmentLength >= 7) {
+			const height = buffer.readUInt16BE(offset + 3);
+			const width = buffer.readUInt16BE(offset + 5);
+			return boundedDimensions(width, height);
+		}
+		offset += segmentLength;
+	}
+	return undefined;
+}
+
+function hasJpegEndMarker(bytes: Uint8Array): boolean {
+	const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	return buffer.length >= 2 && buffer[buffer.length - 2] === 0xff && buffer[buffer.length - 1] === 0xd9;
+}
+
+function readWebpDimensions(bytes: Uint8Array): { width: number; height: number } | undefined {
+	const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (
+		buffer.length < 20 ||
+		buffer.toString("ascii", 0, 4) !== "RIFF" ||
+		buffer.toString("ascii", 8, 12) !== "WEBP"
+	) {
+		return undefined;
+	}
+	const declaredSize = buffer.readUInt32LE(4) + 8;
+	if (declaredSize !== buffer.length) return undefined;
+	let offset = 12;
+	while (offset + 8 <= buffer.length) {
+		const chunkType = buffer.toString("ascii", offset, offset + 4);
+		const chunkSize = buffer.readUInt32LE(offset + 4);
+		const dataStart = offset + 8;
+		const dataEnd = dataStart + chunkSize;
+		if (dataEnd > buffer.length) return undefined;
+		if (chunkType === "VP8X" && chunkSize >= 10) {
+			const width = 1 + buffer.readUIntLE(dataStart + 4, 3);
+			const height = 1 + buffer.readUIntLE(dataStart + 7, 3);
+			return boundedDimensions(width, height);
+		}
+		if (chunkType === "VP8 " && chunkSize >= 10) {
+			if (
+				buffer[dataStart + 3] === 0x9d &&
+				buffer[dataStart + 4] === 0x01 &&
+				buffer[dataStart + 5] === 0x2a
+			) {
+				const width = buffer.readUInt16LE(dataStart + 6) & 0x3fff;
+				const height = buffer.readUInt16LE(dataStart + 8) & 0x3fff;
+				return boundedDimensions(width, height);
+			}
+		}
+		if (chunkType === "VP8L" && chunkSize >= 5 && buffer[dataStart] === 0x2f) {
+			const width = 1 + ((buffer[dataStart + 1] | (buffer[dataStart + 2] << 8)) & 0x3fff);
+			const height = 1 + ((buffer[dataStart + 2] >> 6) | (buffer[dataStart + 3] << 2) | (buffer[dataStart + 4] << 10));
+			return boundedDimensions(width, height);
+		}
+		offset = dataEnd + (chunkSize % 2);
+	}
+	return undefined;
+}
+
 function extractBase64(value: string): string {
 	const trimmed = value.trim();
 	const dataUrl = DATA_URL_PATTERN.exec(trimmed);
 	return (dataUrl?.[1] ?? trimmed).trim();
 }
 
-export function decodeGeneratedPng(value: string):
-	| { ok: true; bytes: Buffer; width: number; height: number }
+function normalizeImageMimeType(value: unknown): ImageGenerationMimeType | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "image/jpg") return "image/jpeg";
+	return (IMAGE_GENERATION_MIME_TYPES as readonly string[]).includes(normalized)
+		? normalized as ImageGenerationMimeType
+		: undefined;
+}
+
+export function readImageMetadata(bytes: Uint8Array):
+	| { mimeType: ImageGenerationMimeType; width: number; height: number }
+	| undefined {
+	if (readPngDimensions(bytes) && hasPngEndChunk(Buffer.from(bytes))) {
+		const dimensions = readPngDimensions(bytes)!;
+		return { mimeType: "image/png", ...dimensions };
+	}
+	if (hasJpegEndMarker(bytes)) {
+		const dimensions = readJpegDimensions(bytes);
+		if (dimensions) return { mimeType: "image/jpeg", ...dimensions };
+	}
+	const dimensions = readWebpDimensions(bytes);
+	if (dimensions) return { mimeType: "image/webp", ...dimensions };
+	return undefined;
+}
+
+export function decodeGeneratedImage(value: string, hintedMimeType?: unknown):
+	| { ok: true; bytes: Buffer; mimeType: ImageGenerationMimeType; width: number; height: number }
 	| { ok: false; reason: "malformed-response" | "oversized-response"; errorMessage: string } {
 	const base64 = extractBase64(value);
 	const maxBase64Chars = Math.ceil(MAX_GENERATED_IMAGE_BYTES / 3) * 4;
@@ -361,16 +462,40 @@ export function decodeGeneratedPng(value: string):
 			errorMessage: "Image generation returned invalid or oversized image data.",
 		};
 	}
-	const dimensions = readPngDimensions(bytes);
-	if (!dimensions) {
+	const metadata = readImageMetadata(bytes);
+	if (!metadata) {
 		bytes.fill(0);
 		return {
 			ok: false,
 			reason: "malformed-response",
-			errorMessage: "Image generation returned data that is not a valid PNG image.",
+			errorMessage: "Image generation returned data that is not a supported PNG, JPEG, or WebP image.",
 		};
 	}
-	return { ok: true, bytes, ...dimensions };
+	if (typeof hintedMimeType === "string" && hintedMimeType.trim()) {
+		const hinted = normalizeImageMimeType(hintedMimeType);
+		if (!hinted || hinted !== metadata.mimeType) {
+			bytes.fill(0);
+			return {
+				ok: false,
+				reason: "malformed-response",
+				errorMessage: "Image generation returned an image with inconsistent MIME metadata.",
+			};
+		}
+	}
+	return { ok: true, bytes, ...metadata };
+}
+
+export function decodeGeneratedPng(value: string):
+	| { ok: true; bytes: Buffer; width: number; height: number }
+	| { ok: false; reason: "malformed-response" | "oversized-response"; errorMessage: string } {
+	const decoded = decodeGeneratedImage(value, "image/png");
+	if (!decoded.ok) return decoded;
+	return {
+		ok: true,
+		bytes: decoded.bytes,
+		width: decoded.width,
+		height: decoded.height,
+	};
 }
 
 export function extractProviderErrorMessage(value: unknown, fallback: string): string {
@@ -384,7 +509,7 @@ export function extractProviderErrorMessage(value: unknown, fallback: string): s
 	return fallback;
 }
 
-export function parseImageGenerationResponse(value: unknown): ParsedImageResponseResult {
+export function parseImagesApiResponse(value: unknown): ParsedImageResponseResult {
 	if (!isRecord(value)) {
 		return {
 			ok: false,
@@ -392,75 +517,56 @@ export function parseImageGenerationResponse(value: unknown): ParsedImageRespons
 			errorMessage: "Image generation returned a non-object response.",
 		};
 	}
-
-	if (value.status !== "completed") {
-		return {
-			ok: false,
-			reason: "request-rejected",
-			errorMessage: extractProviderErrorMessage(
-				value,
-				`Image generation did not complete (status: ${String(value.status ?? "unknown")}).`,
-			),
-		};
-	}
-	if (!Array.isArray(value.output)) {
+	if (!Array.isArray(value.data)) {
 		return {
 			ok: false,
 			reason: "malformed-response",
-			errorMessage: "Image generation response did not contain an output array.",
+			errorMessage: "Image generation response did not contain a data array.",
 		};
 	}
-
-	const calls = new Map<string, { result: string; revisedPrompt?: string }>();
-	for (let index = 0; index < value.output.length; index += 1) {
-		const item = value.output[index];
-		if (!isRecord(item) || item.type !== "image_generation_call") continue;
-		if (item.status !== "completed") continue;
-		const result = typeof item.result === "string"
-			? item.result
-			: typeof item.b64_json === "string"
-				? item.b64_json
-				: undefined;
-		if (!result?.trim()) continue;
-		const id = normalizedOptionalString(item.id, MAX_IMAGE_IDENTIFIER_CHARS) ?? `image_generation_${index}`;
-		const revisedPrompt = normalizedOptionalString(item.revised_prompt, MAX_IMAGE_DIAGNOSTIC_CHARS);
-		const existing = calls.get(id);
-		if (existing && existing.result !== result) {
-			return {
-				ok: false,
-				reason: "malformed-response",
-				errorMessage: "Image generation returned conflicting results for one image call.",
-			};
-		}
-		calls.set(id, { result, revisedPrompt: revisedPrompt ?? existing?.revisedPrompt });
-	}
-
-	if (calls.size === 0) {
+	if (value.data.length === 0) {
 		return {
 			ok: false,
 			reason: "no-image",
 			errorMessage: "Image generation completed without a usable image result.",
 		};
 	}
-	if (calls.size !== 1) {
+	if (value.data.length !== 1) {
 		return {
 			ok: false,
 			reason: "malformed-response",
-			errorMessage: "Image generation returned more than one image result for a single-image request.",
+			errorMessage: "Image generation returned more than one image for a single request.",
 		};
 	}
 
-	const [imageCallId, call] = [...calls.entries()][0]!;
-	const decoded = decodeGeneratedPng(call.result);
+	const item = value.data[0];
+	if (!isRecord(item) || typeof item.b64_json !== "string" || !item.b64_json.trim()) {
+		return {
+			ok: false,
+			reason: "no-image",
+			errorMessage: "Image generation response did not contain base64 image data.",
+		};
+	}
+	const mimeHint = item.mime_type ?? item.mimeType;
+	if (mimeHint !== undefined && typeof mimeHint !== "string") {
+		return {
+			ok: false,
+			reason: "malformed-response",
+			errorMessage: "Image generation returned invalid MIME metadata.",
+		};
+	}
+	const decoded = decodeGeneratedImage(item.b64_json, mimeHint);
 	if (!decoded.ok) return decoded;
 
 	return {
 		ok: true,
 		image: {
 			bytes: decoded.bytes,
-			imageCallId,
+			mimeType: decoded.mimeType,
+			imageCallId:
+				normalizedOptionalString(item.id, MAX_IMAGE_IDENTIFIER_CHARS) ?? "image_generation_0",
 			responseId: normalizedOptionalString(value.id, MAX_IMAGE_IDENTIFIER_CHARS),
-			revisedPrompt: call.revisedPrompt,
+			revisedPrompt: normalizedOptionalString(item.revised_prompt, MAX_IMAGE_DIAGNOSTIC_CHARS),
 			width: decoded.width,
 			height: decoded.height,
 		},
@@ -469,5 +575,5 @@ export function parseImageGenerationResponse(value: unknown): ParsedImageRespons
 
 export const _protocolTest = {
 	PNG_SIGNATURE,
-	IMAGE_GENERATION_MIME_TYPE,
+	IMAGE_GENERATION_MIME_TYPES,
 };
