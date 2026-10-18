@@ -50,7 +50,7 @@ test("a transcript without a retired window reports nothing", () => {
 	// The very first window has retired nothing, so there is no cliff to measure.
 	expect(
 		measureWindowBulk({
-			messages: [windowMarker("w1"), turn("a")],
+			messages: [turn(RETIRED_BULK), windowMarker("w1"), turn("a")],
 			contextWindow: 272_000,
 		}),
 	).toBeUndefined();

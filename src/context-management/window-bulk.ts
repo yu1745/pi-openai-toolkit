@@ -107,6 +107,9 @@ export function measureWindowBulk(args: {
 	if (boundaryIndex < 1) return undefined;
 
 	const boundaryMessage = messages[boundaryIndex]!;
+	// The first window may begin after a provider switch. It has retired no
+	// transcript: its pre-marker turns are still part of the managed view.
+	if (isContextWindowBoundary(boundaryMessage) && boundaryMessage.details.contextManagement.windowNumber === 0) return undefined;
 	const windowId = isContextWindowBoundary(boundaryMessage)
 		? boundaryMessage.details.contextManagement.currentWindowId
 		: undefined;

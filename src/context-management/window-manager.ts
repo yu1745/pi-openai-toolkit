@@ -280,7 +280,11 @@ export class CodexContextWindowManager {
 		}
 		// Projection observes the request view, never durable session state. A
 		// queued rollover marker must not clear the duplicate guard here.
-		const trimmed = boundaryIndex < 0 ? [...messages] : this.trimToWindow(messages, boundaryIndex);
+		// Window zero can start mid-session (for example after switching from another
+		// provider). Its boundary establishes identity, not a history cutoff.
+		const trimmed = boundaryIndex < 0 || this.identity?.windowNumber === 0
+			? [...messages]
+			: this.trimToWindow(messages, boundaryIndex);
 		const projected = mode === "remote" ? projectEncryptedToolResults(trimmed) : trimmed;
 		this.projectedContextTokens = mode === "remote" && this.identity
 			? estimateProjectedWindowTokens(projected)

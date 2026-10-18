@@ -104,6 +104,24 @@ test("initializes and restores a persisted window marker", () => {
 	expect(restored.currentIdentity()).toEqual(identity);
 });
 
+test("switching into the initial remote window retains earlier provider history until rollover", async () => {
+	const sent: Array<Record<string, unknown>> = [];
+	const branch: Array<Record<string, unknown>> = [];
+	const manager = new CodexContextWindowManager(async () => undefined);
+	const ctx = fakeContext(() => branch);
+	const earlier = { role: "user", content: "Earlier conversation on another provider", timestamp: 1 } as AgentMessage;
+	manager.ensureInitialized(fakePi(sent), ctx, true);
+	persistSentMarker(branch, sent[0]!);
+	const firstMarker = { role: "custom", customType: CODEX_CONTEXT_WINDOW_MESSAGE_TYPE, details: sent[0]!.details } as AgentMessage;
+	expect(manager.project([earlier, firstMarker], "remote")).toContain(earlier);
+	manager.synchronize(ctx);
+	expect(manager.project([earlier, firstMarker], "remote")).toContain(earlier);
+
+	await manager.startNewWindow(fakePi(sent), ctx, { triggerTurn: true, trimPreviousWindow: true });
+	const nextMarker = { role: "custom", customType: CODEX_CONTEXT_WINDOW_MESSAGE_TYPE, details: sent[1]!.details } as AgentMessage;
+	expect(manager.project([earlier, firstMarker, nextMarker], "remote")).not.toContain(earlier);
+});
+
 test("keeps a rollover guard until its target marker is persisted, then allows the next rollover", async () => {
 	const sent: Array<Record<string, unknown>> = [];
 	const branch: Array<Record<string, unknown>> = [];
